@@ -18,17 +18,22 @@ import asyncio
 import copy
 import difflib
 import hashlib
+import importlib.metadata
 import json
 import os
+import platform
+import subprocess
 import sys
 import time
 import uuid
+import warnings
 from collections import Counter
 from collections.abc import Awaitable
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 
 HERE = Path(__file__).resolve().parent
@@ -44,6 +49,7 @@ OPTIMIZER_DEV_PATH = HERE / "optimizer_dev.evalset.json"
 VAL_PATH = HERE / "val.evalset.json"
 FIXTURE_PATH = HERE / "fixtures" / "fake_outputs.json"
 OPTIMIZER_CONFIG_PATH = HERE / "optimizer.json"
+REPORT_SCHEMA_PATH = HERE / "optimization_report.schema.json"
 PROMPT_DIR = HERE / "agent" / "prompts"
 SYSTEM_PROMPT_PATH = PROMPT_DIR / "system.md"
 ROUTER_PROMPT_PATH = PROMPT_DIR / "router.md"
@@ -56,6 +62,9 @@ ONLINE_ENV_VARS = (
     "TRPC_AGENT_API_KEY",
     "TRPC_AGENT_BASE_URL",
     "TRPC_AGENT_MODEL_NAME",
+)
+KNOWN_ONLINE_WARNING_FILTERS = (
+    "SSEDecoder._aiter_chunks close RuntimeWarning",
 )
 
 TAXONOMY = (
@@ -117,8 +126,71 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def validate_report_schema(report: dict[str, Any]) -> None:
+    from jsonschema import Draft202012Validator
+
+    schema = load_json(REPORT_SCHEMA_PATH)
+    Draft202012Validator(schema).validate(report)
+
+
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _git_output(*args: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:  # noqa: BLE001 - environment snapshot must not fail the run.
+        return None
+    return proc.stdout.strip()
+
+
+def sdk_version() -> str | None:
+    try:
+        return importlib.metadata.version("trpc-agent-py")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def base_url_host(base_url: str | None) -> str | None:
+    if not base_url:
+        return None
+    parsed = urlparse(base_url)
+    return parsed.hostname or None
+
+
+def environment_snapshot(
+    *,
+    seed: int,
+    command: str | None,
+    config_path: str,
+) -> dict[str, Any]:
+    return {
+        "git_commit": _git_output("rev-parse", "HEAD"),
+        "git_dirty": bool(_git_output("status", "--porcelain")),
+        "python_version": platform.python_version(),
+        "sdk_version": sdk_version(),
+        "model_name": os.getenv("TRPC_AGENT_MODEL_NAME"),
+        "base_url_host": base_url_host(os.getenv("TRPC_AGENT_BASE_URL")),
+        "seed": seed,
+        "command": command or "programmatic",
+        "config_path": config_path,
+        "known_warning_filters": list(KNOWN_ONLINE_WARNING_FILTERS),
+    }
+
+
+def install_known_online_warning_filters() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=r"coroutine method 'aclose' of 'SSEDecoder\._aiter_chunks' was never awaited",
+        category=RuntimeWarning,
+    )
 
 
 def resolve_path(path: Path | None, default: Path) -> Path:
@@ -1053,6 +1125,7 @@ def build_top_level_report(
     cost: dict[str, Any],
     duration_seconds: float,
     config_snapshot: dict[str, Any],
+    command: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     winner = pick_winner(candidates)
@@ -1098,6 +1171,11 @@ def build_top_level_report(
         "cost": cost,
         "duration_seconds": round(duration_seconds, 6),
         "config_snapshot": config_snapshot,
+        "environment_snapshot": environment_snapshot(
+            seed=seed,
+            command=command,
+            config_path=str((config_snapshot.get("paths") or {}).get("optimizer_config", "")),
+        ),
         "artifacts": artifacts,
     }
     if extra:
@@ -1113,6 +1191,7 @@ def make_report(
     seed: int,
     started: float,
     extra_artifacts: dict[str, str] | None = None,
+    command: str | None = None,
 ) -> dict[str, Any]:
     report = asyncio.run(
         build_offline_report(
@@ -1129,6 +1208,7 @@ def make_report(
             gate_config=load_gate_config(optimizer_config=OPTIMIZER_CONFIG_PATH.resolve()),
             system_prompt=SYSTEM_PROMPT_PATH.resolve(),
             router_prompt=ROUTER_PROMPT_PATH.resolve(),
+            command=command,
         )
     )
     if extra_artifacts:
@@ -1151,6 +1231,7 @@ async def build_offline_report(
     gate_config: dict[str, Any],
     system_prompt: Path,
     router_prompt: Path,
+    command: str | None = None,
 ) -> dict[str, Any]:
     train_payload = load_json(train_evalset)
     optimizer_dev_payload = load_json(optimizer_dev_evalset)
@@ -1357,6 +1438,7 @@ async def build_offline_report(
                 "router_prompt": str(router_prompt),
             },
         },
+        command=command,
     )
 
 
@@ -1563,6 +1645,7 @@ async def run_fake_or_trace(
     gate_config: dict[str, Any] | None = None,
     system_prompt: Path | None = None,
     router_prompt: Path | None = None,
+    command: str | None = None,
 ) -> Path:
     started = time.perf_counter()
     actual_run_id = run_id or datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
@@ -1591,6 +1674,7 @@ async def run_fake_or_trace(
         gate_config=gate,
         system_prompt=system_path,
         router_prompt=router_path,
+        command=command,
     )
     write_report(run_dir, report)
     return run_dir
@@ -1609,9 +1693,11 @@ async def run_online(
     gate_config: dict[str, Any] | None = None,
     system_prompt: Path | None = None,
     router_prompt: Path | None = None,
+    command: str | None = None,
 ) -> Path:
     from agent.config import get_model_config
 
+    install_known_online_warning_filters()
     preflight = require_online_preflight()
     print(format_online_preflight(preflight))
     get_model_config()
@@ -1812,6 +1898,7 @@ async def run_online(
                 "router_prompt": str(router_path),
             },
         },
+        command=command,
         extra={**_optimizer_extra(result), "online_preflight": preflight},
     )
     write_report(run_dir, report)
@@ -1882,6 +1969,7 @@ def render_markdown(report: dict[str, Any]) -> str:
 
 
 def write_report(run_dir: Path, report: dict[str, Any]) -> None:
+    validate_report_schema(report)
     write_json(run_dir / "optimization_report.json", report)
     (run_dir / "optimization_report.md").write_text(render_markdown(report), encoding="utf-8")
 
@@ -1901,6 +1989,8 @@ async def amain(argv: list[str] | None = None) -> Path:
     parser.add_argument("--system-prompt", type=Path, default=SYSTEM_PROMPT_PATH)
     parser.add_argument("--router-prompt", type=Path, default=ROUTER_PROMPT_PATH)
     args = parser.parse_args(argv)
+    command_args = sys.argv[1:] if argv is None else argv
+    command = " ".join([sys.executable, str(Path(__file__).resolve()), *command_args])
 
     if args.mode in {"fake", "trace"}:
         run_dir = await run_fake_or_trace(
@@ -1916,6 +2006,7 @@ async def amain(argv: list[str] | None = None) -> Path:
             gate_config_path=args.gate_config,
             system_prompt=args.system_prompt,
             router_prompt=args.router_prompt,
+            command=command,
         )
     else:
         run_dir = await run_online(
@@ -1929,6 +2020,7 @@ async def amain(argv: list[str] | None = None) -> Path:
             gate_config_path=args.gate_config,
             system_prompt=args.system_prompt,
             router_prompt=args.router_prompt,
+            command=command,
         )
     print(run_dir)
     return run_dir

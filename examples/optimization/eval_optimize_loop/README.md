@@ -50,7 +50,10 @@ Each run writes to `runs/<run_id>/` by default:
 
 The top-level report always includes `run_id`, `mode`, `seed`, `baseline`,
 `candidates`, `delta`, `gate_decision`, `failure_attribution`, `cost`,
-`duration_seconds`, `config_snapshot`, and `artifacts`.
+`duration_seconds`, `config_snapshot`, `environment_snapshot`, and `artifacts`.
+`optimization_report.schema.json` is the contract used by the CLI before it
+writes `optimization_report.json`; schema validation failures stop report
+generation instead of producing a partial artifact.
 
 A compact sample output is checked in at `fixtures/optimization_report.sample.json`.
 
@@ -79,6 +82,12 @@ the final JSON response and scores only `route`, `tool.name`, and
 `tool.arguments`. Reason wording and safety are handled by the rubric metric, so
 a harmless explanation rewrite does not zero out an otherwise correct route.
 
+`environment_snapshot` records the git commit, dirty flag, Python version, SDK
+version when installed, model name, redacted base URL host, seed, command, and
+optimizer config path. It never records API keys. Known provider/runtime noise
+from DeepSeek schema downgrades and SSE decoder shutdown is isolated from the
+online smoke output.
+
 `optimizer_dev.evalset.json` is the optimizer-internal holdout passed to
 `AgentOptimizer.optimize(..., validation_dataset_path=...)`. `val.evalset.json`
 is the final validation set and is only used for baseline scoring and final
@@ -99,3 +108,8 @@ pytest tests/evaluation/test_eval_optimize_loop_example.py -q
 python examples/optimization/eval_optimize_loop/run_pipeline.py --mode fake
 python examples/optimization/eval_optimize_loop/run_pipeline.py --mode trace
 ```
+
+Full repository pytest includes optional integration suites. In an environment
+without optional extras such as Cube/E2B, Mempalace, A2A, AG-UI, Claude Agent
+SDK, or OpenClaw dependencies, `tests/conftest.py` ignores those suites during
+collection and prints the missing dependency list in the pytest header.

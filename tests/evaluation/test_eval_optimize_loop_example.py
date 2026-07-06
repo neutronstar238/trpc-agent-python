@@ -18,10 +18,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from jsonschema import ValidationError
 
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[2] / "examples" / "optimization" / "eval_optimize_loop"
 RUN_PIPELINE = EXAMPLE_DIR / "run_pipeline.py"
+REPORT_SCHEMA = EXAMPLE_DIR / "optimization_report.schema.json"
 ROUTE_TOOL_ARGS_METRIC = "route_tool_args_score"
 
 
@@ -110,6 +112,7 @@ def test_directory_layout_and_assets_exist():
         "README.md",
         "run_pipeline.py",
         "optimizer.json",
+        "optimization_report.schema.json",
         "train.evalset.json",
         "optimizer_dev.evalset.json",
         "val.evalset.json",
@@ -195,6 +198,18 @@ def test_readme_includes_design_notes_and_sample_report_shape():
     }
 
 
+def test_sample_report_validates_against_schema_and_required_fields_are_enforced():
+    module = load_pipeline_module()
+    sample = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+
+    module.validate_report_schema(sample)
+
+    broken = dict(sample)
+    broken.pop("environment_snapshot", None)
+    with pytest.raises(ValidationError):
+        module.validate_report_schema(broken)
+
+
 def test_router_prompt_is_instructional_not_a_gold_answer():
     prompt = (EXAMPLE_DIR / "agent" / "prompts" / "router.md").read_text(encoding="utf-8")
 
@@ -240,6 +255,10 @@ async def test_fake_mode_generates_complete_report_and_selects_local_patch(tmp_p
     assert report["artifacts"]["optimizer_dev_evalset"].endswith("optimizer_dev.evalset.json")
     assert report["artifacts"]["final_validation_evalset"].endswith("val.evalset.json")
     assert report["delta"]["validation_score"] == pytest.approx(1 / 3)
+    assert "environment_snapshot" in report
+    assert report["environment_snapshot"]["seed"] == 7
+    assert report["environment_snapshot"]["config_path"].endswith("optimizer.json")
+    module.validate_report_schema(report)
     assert (run_dir / "optimization_report.md").is_file()
 
 
@@ -330,6 +349,7 @@ async def test_trace_mode_uses_replay_without_api_keys(tmp_path: Path, monkeypat
     report = load_report(run_dir / "optimization_report.json")
     assert report["mode"] == "trace"
     assert report["gate_decision"]["winner"] == "candidate_local_patch"
+    module.validate_report_schema(report)
     assert (run_dir / "trace_evalset.json").is_file()
     assert (run_dir / "trace_metrics.json").is_file()
     trace_payload = load_report(run_dir / "trace_evalset.json")
@@ -624,9 +644,16 @@ async def test_fake_mode_records_prompt_artifacts(tmp_path: Path):
         run_id="prompt_audit",
     )
     report = load_report(run_dir / "optimization_report.json")
-    candidate = next(item for item in report["candidates"] if item["id"] == "candidate_local_patch")
 
-    for prompt_artifact in report["baseline"]["prompt_artifacts"] + candidate["prompt_artifacts"]:
+    all_artifacts = list(report["baseline"]["prompt_artifacts"])
+    for candidate in report["candidates"]:
+        all_artifacts.extend(candidate["prompt_artifacts"])
+        assert Path(candidate["artifacts"]["prompt_patch"]).is_file()
+
+    expected_count = 2 * (1 + len(report["candidates"]))
+    assert len(all_artifacts) == expected_count
+
+    for prompt_artifact in all_artifacts:
         assert prompt_artifact["name"] in {"system_prompt", "router_prompt"}
         assert Path(prompt_artifact["source_path"]).is_file()
         assert Path(prompt_artifact["candidate_path"]).is_file()
@@ -634,8 +661,6 @@ async def test_fake_mode_records_prompt_artifacts(tmp_path: Path):
         assert prompt_artifact["source_written"] is False
         assert prompt_artifact["summary"]
         assert "diff" in prompt_artifact
-
-    assert Path(candidate["artifacts"]["prompt_patch"]).is_file()
 
 
 def test_online_preflight_reports_presence_without_secret(monkeypatch: pytest.MonkeyPatch):
@@ -722,6 +747,7 @@ async def test_online_mode_can_construct_optimizer_call_without_real_api(
     assert captured["config_path"].endswith("optimizer.json")
     assert captured["train_dataset_path"].endswith("train.evalset.json")
     assert captured["validation_dataset_path"].endswith("optimizer_dev.evalset.json")
+    assert not captured["validation_dataset_path"].endswith("val.evalset.json")
     assert captured["update_source"] is False
     assert sorted(captured["target_prompt"].names()) == ["router_prompt", "system_prompt"]
     report = load_report(run_dir / "optimization_report.json")
@@ -733,11 +759,90 @@ async def test_online_mode_can_construct_optimizer_call_without_real_api(
     assert report["artifacts"]["native_baseline_prompts_dir"].endswith("baseline_prompts")
     assert report["artifacts"]["native_best_prompts_dir"].endswith("best_prompts")
     assert report["artifacts"]["native_config_snapshot_json"].endswith("config.snapshot.json")
+    assert report["environment_snapshot"]["model_name"] == "fake-model"
+    assert report["environment_snapshot"]["base_url_host"] == "localhost"
+    assert report["environment_snapshot"]["command"]
+    module.validate_report_schema(report)
     assert report["cost"]["estimated_total"] is None
     assert report["cost"]["cost_source"] == "unknown"
     assert report["cost"]["optimizer"]["model_calls"] == 5
     assert report["cost"]["optimizer"]["token_usage"]["total"] == 10
     assert report["cost"]["final_revalidation"]["model_calls"] > 0
+
+
+@pytest.mark.asyncio
+async def test_online_optimizer_validation_improvement_is_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("TRPC_AGENT_API_KEY", "fake-key")
+    monkeypatch.setenv("TRPC_AGENT_BASE_URL", "http://localhost/fake")
+    monkeypatch.setenv("TRPC_AGENT_MODEL_NAME", "fake-model")
+    module = load_pipeline_module()
+
+    class FakeResult:
+        status = "SUCCEEDED"
+        baseline_pass_rate = 0.5
+        best_pass_rate = 1.0
+        pass_rate_improvement = 0.5
+        stop_reason = "required_metrics_passing"
+        total_llm_cost = 0.0
+        total_reflection_lm_calls = 0
+        total_judge_model_calls = 0
+        best_prompts = {"system_prompt": "better system", "router_prompt": "better router"}
+        baseline_prompts = {"system_prompt": "baseline system", "router_prompt": "baseline router"}
+        baseline_metric_breakdown = {ROUTE_TOOL_ARGS_METRIC: 0.5}
+        best_metric_breakdown = {ROUTE_TOOL_ARGS_METRIC: 1.0}
+        metric_thresholds = {ROUTE_TOOL_ARGS_METRIC: 1.0}
+        duration_seconds = 0.01
+        total_token_usage = {"prompt": 0, "completion": 0, "total": 0}
+
+    async def fake_optimize(**kwargs):
+        output_dir = Path(kwargs["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "result.json").write_text("{}", encoding="utf-8")
+        (output_dir / "summary.txt").write_text("fake", encoding="utf-8")
+        return FakeResult()
+
+    def summary(score: float, passed: bool) -> dict[str, Any]:
+        return {
+            "eval_set_id": "fake",
+            "score": score,
+            "pass_rate": 1.0 if passed else 0.5,
+            "metrics": {
+                ROUTE_TOOL_ARGS_METRIC: {"score": score, "threshold": 1.0, "passed": passed, "status": "passed" if passed else "failed"},
+                "llm_rubric_response": {"score": 1.0, "threshold": 0.66, "passed": True, "status": "passed"},
+            },
+            "case_results": [
+                {"case_id": "case_1", "score": score, "passed": passed, "tags": [], "metrics": {}, "root_cause": "", "reasons": []},
+            ],
+            "failed_case_ids": [] if passed else ["case_1"],
+            "source": "AgentEvaluator",
+        }
+
+    summaries = iter([
+        summary(0.5, False),
+        summary(0.5, False),
+        summary(0.5, False),
+        summary(1.0, True),
+        summary(1.0, True),
+        summary(1.0, True),
+    ])
+
+    async def fake_run_evaluator(**_: Any) -> dict[str, Any]:
+        return next(summaries)
+
+    import trpc_agent_sdk.evaluation as evaluation_pkg
+
+    monkeypatch.setattr(evaluation_pkg.AgentOptimizer, "optimize", staticmethod(fake_optimize))
+    monkeypatch.setattr(module, "run_evaluator", fake_run_evaluator)
+
+    run_dir = await module.run_online(seed=7, output_dir=tmp_path, run_id="online_improved")
+    report = load_report(run_dir / "optimization_report.json")
+
+    assert report["gate_decision"]["accepted"] is True
+    assert report["gate_decision"]["winner"] == "optimizer_best"
+    module.validate_report_schema(report)
 
 
 @pytest.mark.asyncio
@@ -750,6 +855,8 @@ async def test_online_optimizer_no_improvement_is_rejected(
     monkeypatch.setenv("TRPC_AGENT_MODEL_NAME", "fake-model")
 
     module = load_pipeline_module()
+    before_system = (EXAMPLE_DIR / "agent" / "prompts" / "system.md").read_text(encoding="utf-8")
+    before_router = (EXAMPLE_DIR / "agent" / "prompts" / "router.md").read_text(encoding="utf-8")
 
     class FakeResult:
         status = "SUCCEEDED"
@@ -792,6 +899,8 @@ async def test_online_optimizer_no_improvement_is_rejected(
     assert report["gate_decision"]["accepted"] is False
     assert report["gate_decision"]["winner"] is None
     assert "validation score did not improve" in " ".join(report["gate_decision"]["reasons"])
+    assert (EXAMPLE_DIR / "agent" / "prompts" / "system.md").read_text(encoding="utf-8") == before_system
+    assert (EXAMPLE_DIR / "agent" / "prompts" / "router.md").read_text(encoding="utf-8") == before_router
 
 
 @pytest.mark.asyncio
@@ -865,6 +974,27 @@ def test_online_e2e_smoke_with_real_api(tmp_path: Path):
     if missing:
         pytest.skip("missing online env vars: " + ", ".join(missing))
 
+    weak_router = tmp_path / "weak_router.md"
+    weak_router.write_text(
+        "\n".join([
+            "You route customer-support requests to one backend action.",
+            "Output exactly one JSON object with keys route, tool, and reason.",
+            "Allowed tools: create_refund_ticket, create_escalation_case, none.",
+            "Baseline v0 policy:",
+            "1. Prefer faq for refund requests unless the user says the refund was already approved.",
+            "2. Prefer faq for account or legal complaints unless the user uses the exact phrase human agent.",
+            "3. Use faq for shipping, coupon, address, and policy questions.",
+            "4. Keep tool.arguments as an empty object.",
+        ]),
+        encoding="utf-8",
+    )
+    before_weak_router = weak_router.read_text(encoding="utf-8")
+    gate_config = tmp_path / "online_gate.json"
+    gate_config.write_text(
+        json.dumps({"max_duration_seconds": 300}),
+        encoding="utf-8",
+    )
+
     proc = subprocess.run(
         [
             sys.executable,
@@ -875,17 +1005,26 @@ def test_online_e2e_smoke_with_real_api(tmp_path: Path):
             str(tmp_path),
             "--run-id",
             "online_e2e",
+            "--router-prompt",
+            str(weak_router),
+            "--gate-config",
+            str(gate_config),
         ],
         check=True,
         capture_output=True,
         text=True,
-        timeout=240,
+        timeout=300,
     )
     run_dir = Path(proc.stdout.strip().splitlines()[-1])
     report = load_report(run_dir / "optimization_report.json")
 
     assert report["mode"] == "online"
+    assert report["gate_decision"]["accepted"] is True
     assert (run_dir / "optimization_report.md").is_file()
+    assert "DeepSeek only supports JSON object response_format" not in proc.stderr
+    assert "SSEDecoder._aiter_chunks" not in proc.stderr
+    assert weak_router.read_text(encoding="utf-8") == before_weak_router
+    load_pipeline_module().validate_report_schema(report)
     assert report["online_preflight"] == {
         "TRPC_AGENT_API_KEY": True,
         "TRPC_AGENT_BASE_URL": True,
