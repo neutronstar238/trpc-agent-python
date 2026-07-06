@@ -1,0 +1,4 @@
+{
+  "description": "Trace-mode actual outputs generated from candidate_local_patch. The pipeline writes these into a temporary eval_mode=trace evalset before invoking AgentEvaluator.",
+  "candidate_id": "candidate_local_patch"
+}
