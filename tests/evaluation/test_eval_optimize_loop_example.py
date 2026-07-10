@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import inspect
 import json
@@ -27,12 +28,98 @@ REPORT_SCHEMA = EXAMPLE_DIR / "optimization_report.schema.json"
 ROUTE_TOOL_ARGS_METRIC = "route_tool_args_score"
 
 
+def _gate_summary(
+    score: float,
+    cases: list[dict[str, Any]],
+    *,
+    metric_passed: bool = True,
+) -> dict[str, Any]:
+    return {
+        "score": score,
+        "metrics": {ROUTE_TOOL_ARGS_METRIC: {"passed": metric_passed}},
+        "case_results": cases,
+    }
+
+
 def load_pipeline_module() -> Any:
     spec = importlib.util.spec_from_file_location("eval_optimize_loop_run_pipeline", RUN_PIPELINE)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def test_gate_fails_closed_for_boundary_and_invalid_evidence():
+    module = load_pipeline_module()
+    baseline = _gate_summary(
+        0.25,
+        [
+            {"case_id": "a", "score": 0.0, "passed": False, "tags": []},
+            {"case_id": "b", "score": 0.5, "passed": True, "tags": ["critical"]},
+        ],
+    )
+    valid_candidate = _gate_summary(
+        0.75,
+        [
+            {"case_id": "a", "score": 1.0, "passed": True, "tags": []},
+            {"case_id": "b", "score": 0.5, "passed": True, "tags": ["critical"]},
+        ],
+    )
+
+    exact_boundary = module.apply_gate(
+        candidate_id="boundary",
+        baseline_val=baseline,
+        candidate_val=valid_candidate,
+        gate_config={
+            "min_validation_delta": 0.5,
+            "required_metrics": [ROUTE_TOOL_ARGS_METRIC],
+        },
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+    assert exact_boundary["accepted"] is False
+
+    missing_case = copy.deepcopy(valid_candidate)
+    missing_case["case_results"] = missing_case["case_results"][:1]
+    missing = module.apply_gate(
+        candidate_id="missing",
+        baseline_val=baseline,
+        candidate_val=missing_case,
+        gate_config={"required_metrics": [ROUTE_TOOL_ARGS_METRIC]},
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+    assert missing["accepted"] is False
+    assert missing["missing_case_ids"] == ["b"]
+
+    extra_case = copy.deepcopy(valid_candidate)
+    extra_case["case_results"].append(
+        {"case_id": "c", "score": 1.0, "passed": True, "tags": []}
+    )
+    extra = module.apply_gate(
+        candidate_id="extra",
+        baseline_val=baseline,
+        candidate_val=extra_case,
+        gate_config={"required_metrics": [ROUTE_TOOL_ARGS_METRIC]},
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+    assert extra["accepted"] is False
+    assert extra["unexpected_case_ids"] == ["c"]
+
+    non_finite = copy.deepcopy(valid_candidate)
+    non_finite["score"] = float("nan")
+    invalid = module.apply_gate(
+        candidate_id="nan",
+        baseline_val=baseline,
+        candidate_val=non_finite,
+        gate_config={"required_metrics": [ROUTE_TOOL_ARGS_METRIC]},
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+    assert invalid["accepted"] is False
+    assert "finite" in " ".join(invalid["reasons"])
+    json.dumps(invalid, allow_nan=False)
 
 
 def load_report(path: Path) -> dict[str, Any]:

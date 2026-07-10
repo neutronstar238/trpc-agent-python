@@ -20,6 +20,7 @@ import difflib
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import subprocess
@@ -949,6 +950,41 @@ def build_case_deltas(baseline_val: dict[str, Any], candidate_val: dict[str, Any
     return deltas
 
 
+def _finite_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _index_gate_cases(
+    evaluation: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    cases = evaluation.get("case_results")
+    if not isinstance(cases, list):
+        return {}, ["case_results must be an array"]
+    indexed: dict[str, dict[str, Any]] = {}
+    issues: list[str] = []
+    for position, case in enumerate(cases):
+        if not isinstance(case, dict) or not str(case.get("case_id", "")).strip():
+            issues.append(f"case_results[{position}] has no case_id")
+            continue
+        case_id = str(case["case_id"])
+        if case_id in indexed:
+            issues.append(f"duplicate case_id: {case_id}")
+            continue
+        indexed[case_id] = case
+    return indexed, issues
+
+
+def _normalized_gate_tags(case: dict[str, Any]) -> set[str]:
+    tags = case.get("tags", [])
+    if not isinstance(tags, (list, tuple, set)):
+        return set()
+    return {str(tag).lower() for tag in tags}
+
+
 def apply_gate(
     *,
     candidate_id: str,
@@ -958,27 +994,71 @@ def apply_gate(
     duration_seconds: float,
     cost_usd: float | None,
 ) -> dict[str, Any]:
-    baseline_by_id = {case["case_id"]: case for case in baseline_val["case_results"]}
-    candidate_by_id = {case["case_id"]: case for case in candidate_val["case_results"]}
+    baseline_by_id, baseline_issues = _index_gate_cases(baseline_val)
+    candidate_by_id, candidate_issues = _index_gate_cases(candidate_val)
     reasons: list[str] = []
-    accepted = True
+    reasons.extend(baseline_issues)
+    reasons.extend(candidate_issues)
+    accepted = not reasons
 
-    validation_delta = candidate_val["score"] - baseline_val["score"]
-    min_delta = float(gate_config.get("min_validation_delta", 0.0))
-    if validation_delta <= 0:
-        accepted = False
-        reasons.append("validation score did not improve over baseline")
-    elif validation_delta < min_delta:
-        accepted = False
-        reasons.append(
-            "validation score improvement "
-            f"{validation_delta:.4f} below required {min_delta:.4f}"
-        )
+    for label, cases in (("baseline", baseline_by_id), ("candidate", candidate_by_id)):
+        for case_id, case in cases.items():
+            if _finite_float(case.get("score")) is None:
+                accepted = False
+                reasons.append(f"{label} case {case_id} score must be a finite number")
+            if not isinstance(case.get("passed"), bool):
+                accepted = False
+                reasons.append(f"{label} case {case_id} passed must be a boolean")
+            if not isinstance(case.get("tags", []), (list, tuple, set)):
+                accepted = False
+                reasons.append(f"{label} case {case_id} tags must be an array")
 
+    baseline_score = _finite_float(baseline_val.get("score"))
+    candidate_score = _finite_float(candidate_val.get("score"))
+    raw_validation_delta = (
+        None
+        if baseline_score is None or candidate_score is None
+        else candidate_score - baseline_score
+    )
+    validation_delta = (
+        raw_validation_delta
+        if raw_validation_delta is not None and math.isfinite(raw_validation_delta)
+        else None
+    )
+    if validation_delta is None:
+        accepted = False
+        reasons.append("baseline and candidate validation scores must be finite numbers")
+    min_delta = _finite_float(gate_config.get("min_validation_delta", 0.0))
+    if min_delta is None:
+        accepted = False
+        reasons.append("minimum validation delta must be a finite number")
+    elif validation_delta is not None:
+        if validation_delta <= 0 and min_delta == 0:
+            accepted = False
+            reasons.append("validation score did not improve over baseline")
+        elif validation_delta <= min_delta:
+            accepted = False
+            reasons.append(
+                "validation score improvement "
+                f"{validation_delta:.4f} must be greater than required {min_delta:.4f}"
+            )
+
+    baseline_ids = set(baseline_by_id)
+    candidate_ids = set(candidate_by_id)
+    missing_case_ids = sorted(baseline_ids - candidate_ids)
+    unexpected_case_ids = sorted(candidate_ids - baseline_ids)
+    if missing_case_ids:
+        accepted = False
+        reasons.append("candidate omitted validation case(s): " + ", ".join(missing_case_ids))
+    if unexpected_case_ids:
+        accepted = False
+        reasons.append("candidate introduced unknown validation case(s): " + ", ".join(unexpected_case_ids))
+
+    common_case_ids = sorted(baseline_ids & candidate_ids)
     new_hard_fail_ids = [
         case_id
-        for case_id, candidate_case in candidate_by_id.items()
-        if baseline_by_id[case_id]["passed"] and not candidate_case["passed"]
+        for case_id in common_case_ids
+        if baseline_by_id[case_id].get("passed") and not candidate_by_id[case_id].get("passed")
     ]
     if new_hard_fail_ids and not gate_config.get("allow_new_hard_fails", False):
         accepted = False
@@ -986,8 +1066,12 @@ def apply_gate(
 
     critical_regression_ids = [
         case_id
-        for case_id, candidate_case in candidate_by_id.items()
-        if "critical" in candidate_case["tags"] and candidate_case["score"] < baseline_by_id[case_id]["score"]
+        for case_id in common_case_ids
+        if "critical" in _normalized_gate_tags(candidate_by_id[case_id])
+        and _finite_float(candidate_by_id[case_id].get("score")) is not None
+        and _finite_float(baseline_by_id[case_id].get("score")) is not None
+        and _finite_float(candidate_by_id[case_id].get("score"))
+        < _finite_float(baseline_by_id[case_id].get("score"))
     ]
     if critical_regression_ids and not gate_config.get("allow_critical_regression", False):
         accepted = False
@@ -998,22 +1082,38 @@ def apply_gate(
         if cost_usd is None:
             accepted = False
             reasons.append("cost budget could not be evaluated because run cost is unknown")
-        elif cost_usd > float(max_cost):
+        elif _finite_float(cost_usd) is None or _finite_float(max_cost) is None:
             accepted = False
-            reasons.append(f"run exceeded cost budget: {cost_usd:.4f} > {float(max_cost):.4f} USD")
+            reasons.append("cost budget requires finite numbers")
+        elif cost_usd > _finite_float(max_cost):
+            accepted = False
+            reasons.append(f"run exceeded cost budget: {cost_usd:.4f} > {_finite_float(max_cost):.4f} USD")
 
     max_seconds = gate_config.get("max_duration_seconds")
-    if max_seconds is not None and duration_seconds > float(max_seconds):
+    if _finite_float(duration_seconds) is None:
         accepted = False
-        reasons.append(f"run exceeded duration budget: {duration_seconds:.2f}s > {float(max_seconds):.2f}s")
+        reasons.append("run duration must be a finite number")
+    elif max_seconds is not None:
+        finite_max_seconds = _finite_float(max_seconds)
+        if finite_max_seconds is None:
+            accepted = False
+            reasons.append("duration budget must be a finite number")
+        elif duration_seconds > finite_max_seconds:
+            accepted = False
+            reasons.append(f"run exceeded duration budget: {duration_seconds:.2f}s > {finite_max_seconds:.2f}s")
 
     required = gate_config.get("required_metrics") or []
+    candidate_metrics = candidate_val.get("metrics")
+    if not isinstance(candidate_metrics, dict):
+        candidate_metrics = {}
+        accepted = False
+        reasons.append("candidate metrics must be an object")
     if required == "all":
-        required = sorted(candidate_val["metrics"].keys())
+        required = sorted(candidate_metrics.keys())
     missing_or_failed = []
     for name in required:
-        metric = candidate_val["metrics"].get(name)
-        if metric is None or not metric.get("passed", False):
+        metric = candidate_metrics.get(name)
+        if not isinstance(metric, dict) or not metric.get("passed", False):
             missing_or_failed.append(name)
     if missing_or_failed:
         accepted = False
@@ -1028,7 +1128,9 @@ def apply_gate(
         "reasons": reasons,
         "new_hard_fail_ids": new_hard_fail_ids,
         "critical_regression_ids": critical_regression_ids,
-        "validation_delta": round(validation_delta, 6),
+        "missing_case_ids": missing_case_ids,
+        "unexpected_case_ids": unexpected_case_ids,
+        "validation_delta": None if validation_delta is None else round(validation_delta, 6),
     }
 
 
