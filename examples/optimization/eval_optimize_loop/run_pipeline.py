@@ -75,6 +75,7 @@ TAXONOMY = (
     "knowledge_gap",
     "format_error",
     "runtime_error",
+    "metric_failed",
 )
 
 OFFLINE_METRICS_CONFIG = {
@@ -488,6 +489,24 @@ def _metric_failed(metric: dict[str, Any]) -> bool:
     return str(metric.get("status", "")).lower() == "failed"
 
 
+def _failed_metric_names(metrics: dict[str, dict[str, Any]]) -> list[str]:
+    return sorted(name for name, metric in metrics.items() if _metric_failed(metric))
+
+
+def _metric_failure_root(failed_metric_names: list[str]) -> tuple[str, str]:
+    rubric = [name for name in failed_metric_names if "rubric" in name or name.startswith("llm_")]
+    if rubric:
+        return "rubric_failed", "rubric metric failed: " + ", ".join(rubric)
+    knowledge = [
+        name
+        for name in failed_metric_names
+        if any(token in name.lower() for token in ("knowledge", "retrieval", "recall", "ground"))
+    ]
+    if knowledge:
+        return "knowledge_gap", "knowledge metric failed: " + ", ".join(knowledge)
+    return "metric_failed", "content metric failed: " + ", ".join(failed_metric_names)
+
+
 def attribute_failure_case(
     *,
     actual_text: str,
@@ -516,8 +535,13 @@ def attribute_failure_case(
             "reasons": ["expected final response is not a valid JSON object"],
         }
 
-    actual_tool = actual.get("tool") or {}
-    expected_tool = expected.get("tool") or {}
+    actual_tool = actual.get("tool")
+    expected_tool = expected.get("tool")
+    if not isinstance(expected_tool, dict):
+        return {
+            "root_cause": "runtime_error",
+            "reasons": ["expected final response has a non-object tool field"],
+        }
     if str(actual.get("route", "")) != str(expected.get("route", "")):
         return {
             "root_cause": "final_response_mismatch",
@@ -525,6 +549,11 @@ def attribute_failure_case(
                 "actual route "
                 f"{actual.get('route')!r} did not match expected route {expected.get('route')!r}"
             ],
+        }
+    if not isinstance(actual_tool, dict):
+        return {
+            "root_cause": "tool_call_error",
+            "reasons": ["actual tool must be a JSON object"],
         }
     if str(actual_tool.get("name", "")) != str(expected_tool.get("name", "")):
         return {
@@ -534,31 +563,31 @@ def attribute_failure_case(
                 f"{actual_tool.get('name')!r} did not match expected tool {expected_tool.get('name')!r}"
             ],
         }
-    if (actual_tool.get("arguments") or {}) != (expected_tool.get("arguments") or {}):
+    actual_arguments = actual_tool.get("arguments", _MISSING)
+    expected_arguments = expected_tool.get("arguments", _MISSING)
+    if not isinstance(expected_arguments, dict):
+        return {
+            "root_cause": "runtime_error",
+            "reasons": ["expected tool arguments must be a JSON object"],
+        }
+    if not isinstance(actual_arguments, dict):
+        return {
+            "root_cause": "parameter_error",
+            "reasons": ["actual tool arguments must be a JSON object"],
+        }
+    if actual_arguments != expected_arguments:
         return {
             "root_cause": "parameter_error",
             "reasons": ["tool arguments did not match expected arguments"],
         }
 
-    failed_metric_names = [name for name, metric in metrics.items() if _metric_failed(metric)]
-    rubric_failed = [
-        name
-        for name in failed_metric_names
-        if "rubric" in name or name.startswith("llm_")
-    ]
-    if rubric_failed:
-        return {
-            "root_cause": "rubric_failed",
-            "reasons": ["rubric metric failed: " + ", ".join(sorted(rubric_failed))],
-        }
+    failed_metric_names = _failed_metric_names(metrics)
     if failed_metric_names:
-        return {
-            "root_cause": "knowledge_gap",
-            "reasons": ["response structure matched, but content failed metric(s): " + ", ".join(failed_metric_names)],
-        }
+        root_cause, reason = _metric_failure_root(failed_metric_names)
+        return {"root_cause": root_cause, "reasons": [reason]}
     return {
-        "root_cause": "rubric_failed",
-        "reasons": ["case failed without a more specific deterministic mismatch"],
+        "root_cause": "metric_failed",
+        "reasons": ["case failed without a reported failed metric"],
     }
 
 

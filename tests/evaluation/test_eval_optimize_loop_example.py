@@ -523,6 +523,45 @@ def test_failure_attribution_taxonomy_handles_parameter_format_and_rubric_failur
     assert rubric["root_cause"] == "rubric_failed"
 
 
+@pytest.mark.parametrize(
+    ("actual_text", "expected_root"),
+    [
+        (
+            '{"route":"faq","tool":"none","reason":"bad shape"}',
+            "tool_call_error",
+        ),
+        (
+            '{"route":"faq","tool":{"name":"none","arguments":null},"reason":"bad args"}',
+            "parameter_error",
+        ),
+        (
+            '{"route":"faq","tool":{"name":"none","arguments":[]},"reason":"bad args"}',
+            "parameter_error",
+        ),
+        (
+            '{"route":"faq","tool":{"name":"none"},"reason":"missing args"}',
+            "parameter_error",
+        ),
+    ],
+)
+def test_failure_attribution_is_total_for_malformed_tool_shapes(
+    actual_text: str,
+    expected_root: str,
+):
+    module = load_pipeline_module()
+    result = module.attribute_failure_case(
+        actual_text=actual_text,
+        expected_text=(
+            '{"route":"faq","tool":{"name":"none","arguments":{}},'
+            '"reason":"expected"}'
+        ),
+        error_message=None,
+        metrics={ROUTE_TOOL_ARGS_METRIC: {"passed": False}},
+    )
+    assert result["root_cause"] == expected_root
+    assert result["reasons"]
+
+
 def test_gate_rejects_when_configured_cost_budget_cannot_be_evaluated():
     module = load_pipeline_module()
     baseline_val = {
