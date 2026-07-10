@@ -416,6 +416,8 @@ def test_build_candidate_report_rejects_case_set_mismatch():
         gate_config={},
         duration_seconds=1.0,
         cost_usd=0.0,
+        seed=7,
+        optimizer_config=EXAMPLE_DIR / "optimizer.json",
     )
 
     assert report["gate"]["accepted"] is False
@@ -452,6 +454,8 @@ def test_build_candidate_report_is_total_for_malformed_validation_cases(candidat
         gate_config={},
         duration_seconds=1.0,
         cost_usd=0.0,
+        seed=7,
+        optimizer_config=EXAMPLE_DIR / "optimizer.json",
     )
 
     assert report["gate"]["accepted"] is False
@@ -487,6 +491,8 @@ def test_build_candidate_report_sanitizes_nonfinite_case_reasons():
         gate_config={},
         duration_seconds=1.0,
         cost_usd=0.0,
+        seed=7,
+        optimizer_config=EXAMPLE_DIR / "optimizer.json",
     )
 
     assert report["gate"]["accepted"] is False
@@ -729,6 +735,33 @@ async def test_fake_mode_generates_complete_report_and_selects_local_patch(tmp_p
     }
     module.validate_report_schema(report)
     assert (run_dir / "optimization_report.md").is_file()
+
+
+def _assert_candidate_audit(candidate: dict[str, Any], seed: int) -> None:
+    audit = candidate["audit"]
+    assert audit["seed"] == seed
+    assert audit["duration_seconds"] >= 0
+    assert audit["cost"]["currency"] == "USD"
+    assert audit["config_sha256"]
+    assert len(audit["config_sha256"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_fake_mode_audits_each_candidate_independently(tmp_path: Path):
+    module = load_pipeline_module()
+    run_dir = await module.run_fake_or_trace(
+        mode="fake",
+        seed=7,
+        output_dir=tmp_path,
+        run_id="candidate_audit",
+    )
+    report = load_report(run_dir / "optimization_report.json")
+
+    assert report["optimization_rounds"] == []
+    for candidate in report["candidates"]:
+        _assert_candidate_audit(candidate, 7)
+        assert Path(candidate["artifacts"]["prompt_dir"]).is_dir()
+        assert Path(candidate["artifacts"]["prompt_patch"]).is_file()
 
 
 @pytest.mark.asyncio
@@ -1298,10 +1331,11 @@ async def test_online_mode_can_construct_optimizer_call_without_real_api(
     assert report["online_result"]["status"] == "SUCCEEDED"
     assert report["artifacts"]["optimizer_dev_evalset"].endswith("optimizer_dev.evalset.json")
     assert report["artifacts"]["final_validation_evalset"].endswith("val.evalset.json")
-    assert report["artifacts"]["native_rounds_dir"].endswith("rounds")
-    assert report["artifacts"]["native_baseline_prompts_dir"].endswith("baseline_prompts")
-    assert report["artifacts"]["native_best_prompts_dir"].endswith("best_prompts")
-    assert report["artifacts"]["native_config_snapshot_json"].endswith("config.snapshot.json")
+    assert report["optimization_rounds"] == []
+    _assert_candidate_audit(report["candidates"][0], 7)
+    for name, value in report["artifacts"].items():
+        if name.startswith("native_") and value:
+            assert Path(value).exists(), name
     assert report["environment_snapshot"]["model_name"] == "fake-model"
     assert report["environment_snapshot"]["base_url_host"] == "localhost"
     assert report["environment_snapshot"]["command"]
@@ -1311,6 +1345,135 @@ async def test_online_mode_can_construct_optimizer_call_without_real_api(
     assert report["cost"]["optimizer"]["model_calls"] == 5
     assert report["cost"]["optimizer"]["token_usage"]["total"] == 10
     assert report["cost"]["final_revalidation"]["model_calls"] > 0
+
+
+@pytest.mark.asyncio
+async def test_online_failed_optimizer_preserves_partial_best_prompt_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("TRPC_AGENT_API_KEY", "fake-key")
+    monkeypatch.setenv("TRPC_AGENT_BASE_URL", "http://localhost/fake")
+    monkeypatch.setenv("TRPC_AGENT_MODEL_NAME", "fake-model")
+    module = load_pipeline_module()
+
+    class FakeResult:
+        status = "FAILED"
+        error_message = "optimizer provider failed"
+        baseline_pass_rate = 0.5
+        best_pass_rate = 0.5
+        pass_rate_improvement = 0.0
+        stop_reason = None
+        total_llm_cost = 0.0
+        total_reflection_lm_calls = 0
+        total_judge_model_calls = 0
+        best_prompts = {"system_prompt": "partial system prompt"}
+        baseline_prompts = {}
+        baseline_metric_breakdown = {ROUTE_TOOL_ARGS_METRIC: 0.5}
+        best_metric_breakdown = {ROUTE_TOOL_ARGS_METRIC: 0.5}
+        metric_thresholds = {ROUTE_TOOL_ARGS_METRIC: 1.0}
+        duration_seconds = 0.01
+        total_token_usage = {"prompt": 0, "completion": 0, "total": 0}
+        rounds: list[Any] = []
+
+    async def fake_optimize(**kwargs: Any) -> FakeResult:
+        output_dir = Path(kwargs["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "result.json").write_text("{}", encoding="utf-8")
+        return FakeResult()
+
+    import trpc_agent_sdk.evaluation as evaluation_pkg
+
+    monkeypatch.setattr(evaluation_pkg.AgentOptimizer, "optimize", staticmethod(fake_optimize))
+    patch_agent_evaluator(monkeypatch, score=0.5, passed=False)
+
+    run_dir = await module.run_online(seed=7, output_dir=tmp_path, run_id="online_failed_partial")
+    report = load_report(run_dir / "optimization_report.json")
+    candidate = report["candidates"][0]
+    router_artifact = next(
+        artifact for artifact in candidate["prompt_artifacts"] if artifact["name"] == "router_prompt"
+    )
+
+    assert report["online_result"]["status"] == "FAILED"
+    assert report["online_result"]["error_message"] == "optimizer provider failed"
+    assert report["gate_decision"]["accepted"] is False
+    assert "optimizer provider failed" in " ".join(candidate["gate"]["reasons"])
+    assert Path(router_artifact["candidate_path"]).read_text(encoding="utf-8") == (
+        EXAMPLE_DIR / "agent" / "prompts" / "router.md"
+    ).read_text(encoding="utf-8")
+    _assert_candidate_audit(candidate, 7)
+
+
+@pytest.mark.asyncio
+async def test_online_round_audit_writes_native_prompt_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("TRPC_AGENT_API_KEY", "fake-key")
+    monkeypatch.setenv("TRPC_AGENT_BASE_URL", "http://localhost/fake")
+    monkeypatch.setenv("TRPC_AGENT_MODEL_NAME", "fake-model")
+    module = load_pipeline_module()
+
+    round_prompt = "optimized system prompt"
+
+    class FakeResult:
+        status = "SUCCEEDED"
+        error_message = ""
+        baseline_pass_rate = 0.5
+        best_pass_rate = 1.0
+        pass_rate_improvement = 0.5
+        stop_reason = "completed"
+        total_llm_cost = 0.01
+        total_reflection_lm_calls = 1
+        total_judge_model_calls = 0
+        best_prompts = {"system_prompt": round_prompt, "router_prompt": "optimized router prompt"}
+        baseline_prompts = {}
+        baseline_metric_breakdown = {ROUTE_TOOL_ARGS_METRIC: 0.5}
+        best_metric_breakdown = {ROUTE_TOOL_ARGS_METRIC: 1.0}
+        metric_thresholds = {ROUTE_TOOL_ARGS_METRIC: 1.0}
+        duration_seconds = 0.01
+        total_token_usage = {"prompt": 8, "completion": 2, "total": 10}
+        rounds = [
+            SimpleNamespace(
+                round=1,
+                optimized_field_names=["system_prompt"],
+                candidate_prompts={"system_prompt": round_prompt},
+                validation_pass_rate=1.0,
+                metric_breakdown={ROUTE_TOOL_ARGS_METRIC: 1.0},
+                accepted=True,
+                acceptance_reason="improved validation",
+                skip_reason=None,
+                error_message=None,
+                failed_case_ids=[],
+                round_llm_cost=0.01,
+                round_token_usage={"prompt": 8, "completion": 2, "total": 10},
+                duration_seconds=0.25,
+            )
+        ]
+
+    async def fake_optimize(**kwargs: Any) -> FakeResult:
+        output_dir = Path(kwargs["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "result.json").write_text("{}", encoding="utf-8")
+        (output_dir / "summary.txt").write_text("complete", encoding="utf-8")
+        (output_dir / "rounds").mkdir()
+        return FakeResult()
+
+    import trpc_agent_sdk.evaluation as evaluation_pkg
+
+    monkeypatch.setattr(evaluation_pkg.AgentOptimizer, "optimize", staticmethod(fake_optimize))
+    patch_agent_evaluator(monkeypatch, score=0.5, passed=False)
+
+    run_dir = await module.run_online(seed=7, output_dir=tmp_path, run_id="online_round_audit")
+    report = load_report(run_dir / "optimization_report.json")
+    round_record = report["optimization_rounds"][0]
+    prompt_path = Path(round_record["prompt_paths"]["system_prompt"])
+
+    assert round_record["round"] == 1
+    assert round_record["optimized_field_names"] == ["system_prompt"]
+    assert prompt_path.is_file()
+    assert prompt_path.read_text(encoding="utf-8") == round_prompt
+    assert round_record["prompt_sha256"]["system_prompt"] == module.sha256_text(round_prompt)
+    assert round_record["accepted"] is True
+    assert round_record["decision_reason"] == "improved validation"
+    assert Path(report["artifacts"]["native_rounds_dir"]).is_dir()
 
 
 @pytest.mark.asyncio

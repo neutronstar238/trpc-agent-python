@@ -140,6 +140,69 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def build_candidate_audit(
+    *,
+    seed: int,
+    duration_seconds: float,
+    cost_usd: float | None,
+    optimizer_config: Path,
+) -> dict[str, Any]:
+    return {
+        "seed": seed,
+        "duration_seconds": round(duration_seconds, 6),
+        "cost": {
+            "currency": "USD",
+            "estimated": cost_usd,
+            "known": cost_usd is not None,
+        },
+        "config_path": str(optimizer_config),
+        "config_sha256": sha256_file(optimizer_config),
+    }
+
+
+def write_optimizer_round_artifacts(
+    *,
+    run_dir: Path,
+    rounds: list[Any],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for round_record in rounds:
+        round_id = int(round_record.round)
+        round_dir = run_dir / "prompts" / f"optimizer_round_{round_id:03d}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        prompt_paths: dict[str, str] = {}
+        prompt_hashes: dict[str, str] = {}
+        for name, content in sorted(round_record.candidate_prompts.items()):
+            prompt_path = round_dir / f"{name}.md"
+            prompt_path.write_text(content, encoding="utf-8")
+            prompt_paths[name] = str(prompt_path)
+            prompt_hashes[name] = sha256_text(content)
+        records.append({
+            "round": round_id,
+            "optimized_field_names": list(round_record.optimized_field_names),
+            "prompt_paths": prompt_paths,
+            "prompt_sha256": prompt_hashes,
+            "validation_pass_rate": float(round_record.validation_pass_rate),
+            "metric_breakdown": dict(round_record.metric_breakdown),
+            "accepted": bool(round_record.accepted),
+            "decision_reason": (
+                round_record.acceptance_reason
+                or round_record.skip_reason
+                or round_record.error_message
+                or "optimizer reported no reason"
+            ),
+            "failed_case_ids": list(round_record.failed_case_ids),
+            "cost_usd": float(round_record.round_llm_cost),
+            "token_usage": dict(round_record.round_token_usage),
+            "duration_seconds": float(round_record.duration_seconds),
+        })
+    return records
+
+
 def _git_output(*args: str) -> str | None:
     try:
         proc = subprocess.run(
@@ -1287,6 +1350,8 @@ def build_candidate_report(
     gate_config: dict[str, Any],
     duration_seconds: float,
     cost_usd: float | None,
+    seed: int,
+    optimizer_config: Path,
     prompt_artifacts: list[dict[str, Any]] | None = None,
     artifacts: dict[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -1300,6 +1365,12 @@ def build_candidate_report(
     )
     return _json_safe({
         "id": candidate_id,
+        "audit": build_candidate_audit(
+            seed=seed,
+            duration_seconds=duration_seconds,
+            cost_usd=cost_usd,
+            optimizer_config=optimizer_config,
+        ),
         "prompt_patch_summary": fixture.get("prompt_patch_summary", ""),
         "prompt_artifacts": prompt_artifacts or [],
         "train": _json_safe(train),
@@ -1359,6 +1430,10 @@ def common_artifacts(
         "system_prompt": str(system_prompt),
         "router_prompt": str(router_prompt),
     }
+
+
+def existing_artifact(path: Path) -> str:
+    return str(path) if path.exists() else ""
 
 
 def build_top_level_report(
@@ -1423,6 +1498,7 @@ def build_top_level_report(
         "failure_attribution": attribution_for(baseline_val),
         "cost": cost,
         "duration_seconds": round(duration_seconds, 6),
+        "optimization_rounds": [],
         "config_snapshot": config_snapshot,
         "environment_snapshot": environment_snapshot(
             seed=seed,
@@ -1543,6 +1619,7 @@ async def build_offline_report(
     for candidate_id, fixture in fixtures.items():
         if candidate_id == "baseline":
             continue
+        candidate_started = time.perf_counter()
         train, train_artifacts = await evaluate_fixture_split(
             mode=mode,
             split="train",
@@ -1573,7 +1650,6 @@ async def build_offline_report(
             run_dir=run_dir,
             metrics_path=metrics_path,
         )
-        duration_seconds = time.perf_counter() - started
         candidate_artifacts = {}
         candidate_artifacts.update(train_artifacts)
         candidate_artifacts.update(optimizer_dev_artifacts)
@@ -1591,6 +1667,7 @@ async def build_offline_report(
             source_written=False,
         )
         candidate_artifacts.update(prompt_paths)
+        candidate_duration_seconds = time.perf_counter() - candidate_started
         candidates.append(
             build_candidate_report(
                 candidate_id=candidate_id,
@@ -1602,8 +1679,10 @@ async def build_offline_report(
                 baseline_optimizer_dev=baseline_optimizer_dev,
                 baseline_val=baseline_val,
                 gate_config=gate_config,
-                duration_seconds=duration_seconds,
+                duration_seconds=candidate_duration_seconds,
                 cost_usd=0.0,
+                seed=seed,
+                optimizer_config=optimizer_config,
                 prompt_artifacts=prompt_artifacts,
                 artifacts=candidate_artifacts,
             )
@@ -1785,6 +1864,7 @@ def _optimizer_extra(result: Any) -> dict[str, Any]:
     return {
         "online_result": {
             "status": result.status,
+            "error_message": sanitize_report_text(getattr(result, "error_message", "")),
             "baseline_pass_rate": result.baseline_pass_rate,
             "best_pass_rate": result.best_pass_rate,
             "pass_rate_improvement": result.pass_rate_improvement,
@@ -1995,11 +2075,16 @@ async def run_online(
     optimizer_dev_payload = load_json(optimizer_dev_path)
     val_payload = load_json(val_path)
     metrics_path = online_metrics_path(run_dir, optimizer_path)
+    source_prompt_texts = {name: text for name, (_, text) in source_prompts.items()}
+    best_prompt_texts = {
+        **source_prompt_texts,
+        **dict(getattr(result, "best_prompts", {}) or {}),
+    }
     baseline_call_agent = make_online_call_agent(system_prompt=system_path, router_prompt=router_path)
     best_call_agent = make_online_call_agent(
         system_prompt=system_path,
         router_prompt=router_path,
-        prompt_texts=dict(result.best_prompts),
+        prompt_texts=best_prompt_texts,
     )
     baseline_train = await run_evaluator(
         evalset_path=train_path,
@@ -2019,6 +2104,7 @@ async def run_online(
         metrics_path=metrics_path,
         call_agent=baseline_call_agent,
     )
+    candidate_started = time.perf_counter()
     best_train = await run_evaluator(
         evalset_path=train_path,
         evalset_payload=train_payload,
@@ -2038,7 +2124,6 @@ async def run_online(
         call_agent=best_call_agent,
     )
 
-    duration_seconds = time.perf_counter() - started
     metrics_config = load_json(metrics_path)
     cost = online_cost_audit(
         result,
@@ -2069,10 +2154,15 @@ async def run_online(
         run_dir=run_dir,
         candidate_id="optimizer_best",
         source_prompts=source_prompts,
-        candidate_prompts=dict(result.best_prompts),
+        candidate_prompts=best_prompt_texts,
         summary="Best prompt returned by AgentOptimizer.optimize(update_source=False).",
         source_written=False,
     )
+    optimization_rounds = write_optimizer_round_artifacts(
+        run_dir=run_dir,
+        rounds=list(getattr(result, "rounds", []) or []),
+    )
+    candidate_duration_seconds = time.perf_counter() - candidate_started
     candidate = build_candidate_report(
         candidate_id="optimizer_best",
         fixture=_optimizer_fixture(result),
@@ -2083,24 +2173,29 @@ async def run_online(
         baseline_optimizer_dev=baseline_optimizer_dev,
         baseline_val=baseline_val,
         gate_config=gate,
-        duration_seconds=duration_seconds,
+        duration_seconds=candidate_duration_seconds,
         cost_usd=cost_usd,
+        seed=seed,
+        optimizer_config=optimizer_path,
         prompt_artifacts=best_prompt_artifacts,
         artifacts={
-            "native_optimizer_dir": str(online_dir),
-            "native_result_json": str(online_dir / "result.json"),
-            "native_summary_txt": str(online_dir / "summary.txt"),
-            "native_rounds_dir": str(online_dir / "rounds"),
-            "native_baseline_prompts_dir": str(online_dir / "baseline_prompts"),
-            "native_best_prompts_dir": str(online_dir / "best_prompts"),
-            "native_best_prompts": str(online_dir / "best_prompts"),
-            "native_config_snapshot_json": str(online_dir / "config.snapshot.json"),
+            "native_optimizer_dir": existing_artifact(online_dir),
+            "native_result_json": existing_artifact(online_dir / "result.json"),
+            "native_summary_txt": existing_artifact(online_dir / "summary.txt"),
+            "native_rounds_dir": existing_artifact(online_dir / "rounds"),
+            "native_baseline_prompts_dir": existing_artifact(online_dir / "baseline_prompts"),
+            "native_best_prompts_dir": existing_artifact(online_dir / "best_prompts"),
+            "native_best_prompts": existing_artifact(online_dir / "best_prompts"),
+            "native_config_snapshot_json": existing_artifact(online_dir / "config.snapshot.json"),
             **best_prompt_paths,
         },
     )
     if result.status != "SUCCEEDED":
         candidate["gate"]["accepted"] = False
         candidate["gate"]["reasons"].append(f"native optimizer status was {result.status}")
+        error_message = sanitize_report_text(getattr(result, "error_message", ""))
+        if error_message:
+            candidate["gate"]["reasons"].append(error_message)
 
     artifacts = common_artifacts(
         run_dir=run_dir,
@@ -2135,7 +2230,7 @@ async def run_online(
         gate_config=gate,
         artifacts=artifacts,
         cost=cost,
-        duration_seconds=duration_seconds,
+        duration_seconds=time.perf_counter() - started,
         config_snapshot={
             "mode": "online",
             "seed": seed,
@@ -2152,7 +2247,11 @@ async def run_online(
             },
         },
         command=command,
-        extra={**_optimizer_extra(result), "online_preflight": preflight},
+        extra={
+            **_optimizer_extra(result),
+            "online_preflight": preflight,
+            "optimization_rounds": optimization_rounds,
+        },
     )
     write_report(run_dir, report)
     return run_dir
