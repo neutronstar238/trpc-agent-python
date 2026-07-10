@@ -248,6 +248,41 @@ def test_required_metric_passed_must_be_true_and_case_deltas_are_total():
     json.dumps(deltas, allow_nan=False)
 
 
+def test_case_deltas_classify_pass_fail_and_score_transitions():
+    module = load_pipeline_module()
+    baseline = {
+        "case_results": [
+            {"case_id": "new_pass", "score": 0.0, "passed": False, "actual_text": "b1"},
+            {"case_id": "new_fail", "score": 1.0, "passed": True, "actual_text": "b2"},
+            {"case_id": "up", "score": 0.4, "passed": True, "actual_text": "b3"},
+            {"case_id": "down", "score": 0.8, "passed": True, "actual_text": "b4"},
+            {"case_id": "same", "score": 1.0, "passed": True, "actual_text": "b5"},
+        ]
+    }
+    candidate = {
+        "case_results": [
+            {"case_id": "new_pass", "score": 1.0, "passed": True, "actual_text": "c1", "root_cause": "", "reasons": []},
+            {"case_id": "new_fail", "score": 0.0, "passed": False, "actual_text": "c2", "root_cause": "format_error", "reasons": ["bad"]},
+            {"case_id": "up", "score": 0.6, "passed": True, "actual_text": "c3", "root_cause": "", "reasons": []},
+            {"case_id": "down", "score": 0.6, "passed": True, "actual_text": "c4", "root_cause": "", "reasons": []},
+            {"case_id": "same", "score": 1.0, "passed": True, "actual_text": "c5", "root_cause": "", "reasons": []},
+        ]
+    }
+
+    by_id = {
+        item["case_id"]: item
+        for item in module.build_case_deltas(baseline, candidate)
+    }
+
+    assert by_id["new_pass"]["change_type"] == "new_pass"
+    assert by_id["new_fail"]["change_type"] == "new_fail"
+    assert by_id["up"]["change_type"] == "score_improved"
+    assert by_id["down"]["change_type"] == "score_regressed"
+    assert by_id["same"]["change_type"] == "unchanged"
+    assert by_id["new_fail"]["baseline_passed"] is True
+    assert by_id["new_fail"]["candidate_passed"] is False
+
+
 def test_build_candidate_report_rejects_case_set_mismatch():
     module = load_pipeline_module()
     baseline = _gate_summary(
@@ -570,6 +605,17 @@ async def test_fake_mode_generates_complete_report_and_selects_local_patch(tmp_p
     assert "environment_snapshot" in report
     assert report["environment_snapshot"]["seed"] == 7
     assert report["environment_snapshot"]["config_path"].endswith("optimizer.json")
+    first_case = report["baseline"]["validation"]["case_results"][0]
+    assert first_case["expected_text"]
+    assert first_case["key_trace"]["invocation_id"]
+    assert first_case["key_trace"]["actual_final_response"] == first_case["actual_text"]
+    assert first_case["key_trace"]["expected_final_response"] == first_case["expected_text"]
+    assert set(first_case["key_trace"]) == {
+        "invocation_id",
+        "actual_final_response",
+        "expected_final_response",
+        "error_message",
+    }
     module.validate_report_schema(report)
     assert (run_dir / "optimization_report.md").is_file()
 

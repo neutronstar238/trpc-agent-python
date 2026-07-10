@@ -623,10 +623,12 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
         runs = set_result.eval_results_by_eval_id.get(eval_id, [])
         if not runs:
             metrics: dict[str, dict[str, Any]] = {}
+            expected_text = case_expected_text(case)
+            error_message = "AgentEvaluator returned no run for case"
             attribution = attribute_failure_case(
                 actual_text="",
-                expected_text=case_expected_text(case),
-                error_message="AgentEvaluator returned no run for case",
+                expected_text=expected_text,
+                error_message=error_message,
                 metrics=metrics,
             )
             case_results.append({
@@ -637,6 +639,13 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
                 "passed": False,
                 "metrics": metrics,
                 "actual_text": "",
+                "expected_text": expected_text,
+                "key_trace": {
+                    "invocation_id": str(case_by_id[eval_id]["conversation"][0].get("invocation_id", "")),
+                    "actual_final_response": "",
+                    "expected_final_response": expected_text,
+                    "error_message": error_message,
+                },
                 "root_cause": attribution["root_cause"],
                 "reasons": attribution["reasons"],
             })
@@ -693,6 +702,13 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
             "passed": run_passed,
             "metrics": merged_metrics,
             "actual_text": actual_text,
+            "expected_text": expected_text,
+            "key_trace": {
+                "invocation_id": str(case_by_id[eval_id]["conversation"][0].get("invocation_id", "")),
+                "actual_final_response": actual_text,
+                "expected_final_response": expected_text,
+                "error_message": error_message,
+            },
             "root_cause": attribution["root_cause"],
             "reasons": attribution["reasons"],
         })
@@ -952,6 +968,22 @@ async def evaluate_fixture_split(
     return summary, artifacts
 
 
+def classify_case_delta(before: dict[str, Any], after: dict[str, Any]) -> str:
+    if not bool(before.get("passed")) and bool(after.get("passed")):
+        return "new_pass"
+    if bool(before.get("passed")) and not bool(after.get("passed")):
+        return "new_fail"
+    before_score = _finite_float(before.get("score"))
+    after_score = _finite_float(after.get("score"))
+    if before_score is None or after_score is None:
+        return "unchanged"
+    if after_score > before_score:
+        return "score_improved"
+    if after_score < before_score:
+        return "score_regressed"
+    return "unchanged"
+
+
 def build_case_deltas(baseline_val: dict[str, Any], candidate_val: dict[str, Any]) -> list[dict[str, Any]]:
     baseline_by_id, _ = _index_gate_cases(baseline_val)
     candidate_by_id, _ = _index_gate_cases(candidate_val)
@@ -968,17 +1000,28 @@ def build_case_deltas(baseline_val: dict[str, Any], candidate_val: dict[str, Any
         )
         if before is None:
             root_cause = "unexpected_candidate"
+            change_type = "unexpected_candidate"
+            reasons = ["candidate introduced an unknown validation case"]
         elif after is None:
             root_cause = "missing_candidate"
+            change_type = "missing_candidate"
+            reasons = ["candidate omitted a baseline validation case"]
         else:
             root_cause = after.get("root_cause", "")
+            change_type = classify_case_delta(before, after)
+            reasons = after.get("reasons", [])
         deltas.append({
             "case_id": case_id,
             "baseline_score": baseline_score,
             "candidate_score": candidate_score,
+            "baseline_passed": None if before is None else bool(before.get("passed")),
+            "candidate_passed": None if after is None else bool(after.get("passed")),
             "delta": delta,
+            "change_type": change_type,
+            "baseline_actual_text": "" if before is None else before.get("actual_text", ""),
+            "candidate_actual_text": "" if after is None else after.get("actual_text", ""),
             "root_cause": root_cause,
-            "reasons": [] if after is None else after.get("reasons", []),
+            "reasons": reasons,
         })
     return deltas
 
@@ -2134,7 +2177,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         for item in winner["case_deltas"]:
             lines.append(
                 "- `{case_id}`: `{baseline_score:.2f}` -> `{candidate_score:.2f}` "
-                "delta `{delta:+.2f}`".format(**item)
+                "delta `{delta:+.2f}` change_type `{change_type}`".format(**item)
             )
 
     lines.extend(["", "## Failure Attribution", ""])
