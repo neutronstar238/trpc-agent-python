@@ -722,8 +722,26 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
     }
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, set):
+        return [_json_safe(item) for item in sorted(value, key=str)]
+    return value
+
+
 def attribution_for(evaluation: dict[str, Any]) -> dict[str, Any]:
-    failed = [case for case in evaluation["case_results"] if not case["passed"]]
+    case_results = evaluation.get("case_results")
+    if not isinstance(case_results, list):
+        case_results = []
+    failed = [
+        case for case in case_results
+        if isinstance(case, dict) and case.get("passed") is not True
+    ]
     counts = Counter({name: 0 for name in TAXONOMY})
     cases = []
     for case in failed:
@@ -733,10 +751,10 @@ def attribution_for(evaluation: dict[str, Any]) -> dict[str, Any]:
         counts[root] += 1
         reasons = case.get("reasons") or ["no failure reason recorded"]
         cases.append({
-            "case_id": case["case_id"],
+            "case_id": str(case.get("case_id", "")),
             "root_cause": root,
-            "score": case["score"],
-            "reasons": reasons,
+            "score": _finite_float(case.get("score")),
+            "reasons": reasons if isinstance(reasons, list) else [str(reasons)],
         })
     covered = sum(1 for case in cases if case["reasons"])
     return {
@@ -935,27 +953,53 @@ async def evaluate_fixture_split(
 
 
 def build_case_deltas(baseline_val: dict[str, Any], candidate_val: dict[str, Any]) -> list[dict[str, Any]]:
-    baseline_by_id = {case["case_id"]: case for case in baseline_val["case_results"]}
+    baseline_by_id, _ = _index_gate_cases(baseline_val)
+    candidate_by_id, _ = _index_gate_cases(candidate_val)
     deltas = []
-    for case in candidate_val["case_results"]:
-        before = baseline_by_id[case["case_id"]]
+    for case_id in sorted(set(baseline_by_id) | set(candidate_by_id)):
+        before = baseline_by_id.get(case_id)
+        after = candidate_by_id.get(case_id)
+        baseline_score = None if before is None else _finite_float(before.get("score"))
+        candidate_score = None if after is None else _finite_float(after.get("score"))
+        delta = (
+            None
+            if baseline_score is None or candidate_score is None
+            else round(candidate_score - baseline_score, 6)
+        )
+        if before is None:
+            root_cause = "unexpected_candidate"
+        elif after is None:
+            root_cause = "missing_candidate"
+        else:
+            root_cause = after.get("root_cause", "")
         deltas.append({
-            "case_id": case["case_id"],
-            "baseline_score": before["score"],
-            "candidate_score": case["score"],
-            "delta": round(case["score"] - before["score"], 6),
-            "root_cause": case.get("root_cause", ""),
-            "reasons": case.get("reasons", []),
+            "case_id": case_id,
+            "baseline_score": baseline_score,
+            "candidate_score": candidate_score,
+            "delta": delta,
+            "root_cause": root_cause,
+            "reasons": [] if after is None else after.get("reasons", []),
         })
     return deltas
 
 
 def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def _score_delta(candidate: Any, baseline: Any) -> float | None:
+    candidate_score = _finite_float(candidate)
+    baseline_score = _finite_float(baseline)
+    if candidate_score is None or baseline_score is None:
+        return None
+    delta = candidate_score - baseline_score
+    return round(delta, 6) if math.isfinite(delta) else None
 
 
 def _index_gate_cases(
@@ -1077,30 +1121,35 @@ def apply_gate(
         accepted = False
         reasons.append("candidate regressed critical case(s): " + ", ".join(critical_regression_ids))
 
+    normalized_cost = None if cost_usd is None else _finite_float(cost_usd)
+    if cost_usd is not None and normalized_cost is None:
+        accepted = False
+        reasons.append("run cost must be a finite number")
+
     max_cost = gate_config.get("max_cost_usd")
-    if max_cost is not None:
-        if cost_usd is None:
-            accepted = False
-            reasons.append("cost budget could not be evaluated because run cost is unknown")
-        elif _finite_float(cost_usd) is None or _finite_float(max_cost) is None:
-            accepted = False
-            reasons.append("cost budget requires finite numbers")
-        elif cost_usd > _finite_float(max_cost):
-            accepted = False
-            reasons.append(f"run exceeded cost budget: {cost_usd:.4f} > {_finite_float(max_cost):.4f} USD")
+    normalized_max_cost = None if max_cost is None else _finite_float(max_cost)
+    if max_cost is not None and normalized_max_cost is None:
+        accepted = False
+        reasons.append("cost budget must be a finite number")
+    elif max_cost is not None and cost_usd is None:
+        accepted = False
+        reasons.append("cost budget could not be evaluated because run cost is unknown")
+    elif max_cost is not None and normalized_cost is not None and normalized_cost > normalized_max_cost:
+        accepted = False
+        reasons.append(f"run exceeded cost budget: {normalized_cost:.4f} > {normalized_max_cost:.4f} USD")
 
     max_seconds = gate_config.get("max_duration_seconds")
-    if _finite_float(duration_seconds) is None:
+    normalized_duration = _finite_float(duration_seconds)
+    normalized_max_seconds = None if max_seconds is None else _finite_float(max_seconds)
+    if normalized_duration is None:
         accepted = False
         reasons.append("run duration must be a finite number")
-    elif max_seconds is not None:
-        finite_max_seconds = _finite_float(max_seconds)
-        if finite_max_seconds is None:
-            accepted = False
-            reasons.append("duration budget must be a finite number")
-        elif duration_seconds > finite_max_seconds:
-            accepted = False
-            reasons.append(f"run exceeded duration budget: {duration_seconds:.2f}s > {finite_max_seconds:.2f}s")
+    elif max_seconds is not None and normalized_max_seconds is None:
+        accepted = False
+        reasons.append("duration budget must be a finite number")
+    elif max_seconds is not None and normalized_duration > normalized_max_seconds:
+        accepted = False
+        reasons.append(f"run exceeded duration budget: {normalized_duration:.2f}s > {normalized_max_seconds:.2f}s")
 
     required = gate_config.get("required_metrics") or []
     candidate_metrics = candidate_val.get("metrics")
@@ -1113,7 +1162,7 @@ def apply_gate(
     missing_or_failed = []
     for name in required:
         metric = candidate_metrics.get(name)
-        if not isinstance(metric, dict) or not metric.get("passed", False):
+        if not isinstance(metric, dict) or metric.get("passed") is not True:
             missing_or_failed.append(name)
     if missing_or_failed:
         accepted = False
@@ -1182,14 +1231,16 @@ def build_candidate_report(
         "id": candidate_id,
         "prompt_patch_summary": fixture.get("prompt_patch_summary", ""),
         "prompt_artifacts": prompt_artifacts or [],
-        "train": train,
-        "optimizer_dev": optimizer_dev,
-        "final_validation": validation,
-        "validation": validation,
+        "train": _json_safe(train),
+        "optimizer_dev": _json_safe(optimizer_dev),
+        "final_validation": _json_safe(validation),
+        "validation": _json_safe(validation),
         "delta": {
-            "train_score": round(train["score"] - baseline_train["score"], 6),
-            "optimizer_dev_score": round(optimizer_dev["score"] - baseline_optimizer_dev["score"], 6),
-            "validation_score": round(validation["score"] - baseline_val["score"], 6),
+            "train_score": _score_delta(train.get("score"), baseline_train.get("score")),
+            "optimizer_dev_score": _score_delta(
+                optimizer_dev.get("score"), baseline_optimizer_dev.get("score")
+            ),
+            "validation_score": _score_delta(validation.get("score"), baseline_val.get("score")),
         },
         "case_deltas": build_case_deltas(baseline_val, validation),
         "gate": gate,

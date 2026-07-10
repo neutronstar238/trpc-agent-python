@@ -122,6 +122,196 @@ def test_gate_fails_closed_for_boundary_and_invalid_evidence():
     json.dumps(invalid, allow_nan=False)
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "gate_config"),
+    [
+        ("duration_seconds", "1.0", {"max_duration_seconds": 10}),
+        ("duration_seconds", True, {"max_duration_seconds": 10}),
+        ("duration_seconds", float("nan"), {"max_duration_seconds": 10}),
+        ("duration_seconds", float("inf"), {"max_duration_seconds": 10}),
+        ("cost_usd", "1.0", {"max_cost_usd": 10}),
+        ("cost_usd", None, {"max_cost_usd": 10}),
+        ("cost_usd", True, {"max_cost_usd": 10}),
+        ("cost_usd", float("nan"), {"max_cost_usd": 10}),
+        ("cost_usd", float("inf"), {"max_cost_usd": 10}),
+        ("config", "0.1", {"min_validation_delta": "0.1"}),
+        ("config", True, {"min_validation_delta": True}),
+        ("config", float("nan"), {"min_validation_delta": float("nan")}),
+        ("config", "10", {"max_duration_seconds": "10"}),
+        ("config", True, {"max_cost_usd": True}),
+        ("config", float("inf"), {"max_cost_usd": float("inf")}),
+    ],
+)
+def test_gate_rejects_malformed_numeric_evidence_without_raising(
+    field: str,
+    value: Any,
+    gate_config: dict[str, Any],
+):
+    module = load_pipeline_module()
+    baseline = _gate_summary(
+        0.25,
+        [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}],
+    )
+    candidate = _gate_summary(
+        0.75,
+        [{"case_id": "a", "score": 0.75, "passed": True, "tags": []}],
+    )
+    duration_seconds: Any = 1.0
+    cost_usd: Any = 0.0
+    if field == "duration_seconds":
+        duration_seconds = value
+    elif field == "cost_usd":
+        cost_usd = value
+
+    result = module.apply_gate(
+        candidate_id="malformed_numeric",
+        baseline_val=baseline,
+        candidate_val=candidate,
+        gate_config=gate_config,
+        duration_seconds=duration_seconds,
+        cost_usd=cost_usd,
+    )
+
+    assert result["accepted"] is False
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "candidate_cases",
+    [
+        None,
+        ["not a case"],
+        [
+            {"case_id": "a", "score": 1.0, "passed": True, "tags": []},
+            {"case_id": "a", "score": 1.0, "passed": True, "tags": []},
+        ],
+        [{"case_id": "a", "score": 1.0, "passed": "true", "tags": []}],
+        [{"case_id": "a", "score": 1.0, "passed": True, "tags": "critical"}],
+        [{"case_id": "a", "score": float("nan"), "passed": True, "tags": []}],
+    ],
+)
+def test_gate_rejects_malformed_case_sets_without_raising(candidate_cases: Any):
+    module = load_pipeline_module()
+    baseline = _gate_summary(
+        0.25,
+        [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}],
+    )
+    candidate = _gate_summary(0.75, candidate_cases)
+
+    result = module.apply_gate(
+        candidate_id="malformed_cases",
+        baseline_val=baseline,
+        candidate_val=candidate,
+        gate_config={"required_metrics": [ROUTE_TOOL_ARGS_METRIC]},
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+
+    assert result["accepted"] is False
+    json.dumps(result, allow_nan=False)
+
+
+def test_required_metric_passed_must_be_true_and_case_deltas_are_total():
+    module = load_pipeline_module()
+    baseline = _gate_summary(
+        0.25,
+        [
+            {"case_id": "a", "score": 0.25, "passed": False, "tags": []},
+            {"case_id": "b", "score": 0.25, "passed": True, "tags": []},
+        ],
+    )
+    candidate = _gate_summary(
+        0.75,
+        [
+            {"case_id": "b", "score": 0.75, "passed": True, "tags": []},
+            {"case_id": "c", "score": 1.0, "passed": True, "tags": []},
+        ],
+    )
+    candidate["metrics"][ROUTE_TOOL_ARGS_METRIC]["passed"] = "false"
+
+    gate = module.apply_gate(
+        candidate_id="string_metric_status",
+        baseline_val=baseline,
+        candidate_val=candidate,
+        gate_config={"required_metrics": [ROUTE_TOOL_ARGS_METRIC]},
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+    assert gate["accepted"] is False
+
+    deltas = module.build_case_deltas(baseline, candidate)
+    assert [item["case_id"] for item in deltas] == ["a", "b", "c"]
+    assert deltas[0]["root_cause"] == "missing_candidate"
+    assert deltas[0]["candidate_score"] is None
+    assert deltas[2]["root_cause"] == "unexpected_candidate"
+    assert deltas[2]["baseline_score"] is None
+    json.dumps(deltas, allow_nan=False)
+
+
+def test_build_candidate_report_rejects_case_set_mismatch():
+    module = load_pipeline_module()
+    baseline = _gate_summary(
+        0.25,
+        [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}],
+    )
+    validation = _gate_summary(
+        0.75,
+        [{"case_id": "b", "score": 0.75, "passed": True, "tags": []}],
+    )
+    report = module.build_candidate_report(
+        candidate_id="mismatched",
+        fixture={},
+        train=baseline,
+        optimizer_dev=baseline,
+        validation=validation,
+        baseline_train=baseline,
+        baseline_optimizer_dev=baseline,
+        baseline_val=baseline,
+        gate_config={},
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+
+    assert report["gate"]["accepted"] is False
+    assert report["gate"]["missing_case_ids"] == ["a"]
+    assert report["gate"]["unexpected_case_ids"] == ["b"]
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "candidate_cases",
+    [
+        None,
+        ["not a case"],
+        [{"case_id": "a", "score": float("nan"), "passed": True, "tags": []}],
+        [{"case_id": "a", "score": 0.75, "passed": "false", "tags": "critical"}],
+    ],
+)
+def test_build_candidate_report_is_total_for_malformed_validation_cases(candidate_cases: Any):
+    module = load_pipeline_module()
+    baseline = _gate_summary(
+        0.25,
+        [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}],
+    )
+    validation = _gate_summary(0.75, candidate_cases)
+    report = module.build_candidate_report(
+        candidate_id="malformed_report",
+        fixture={},
+        train=baseline,
+        optimizer_dev=baseline,
+        validation=validation,
+        baseline_train=baseline,
+        baseline_optimizer_dev=baseline,
+        baseline_val=baseline,
+        gate_config={},
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+
+    assert report["gate"]["accepted"] is False
+    json.dumps(report, allow_nan=False)
+
+
 def load_report(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
