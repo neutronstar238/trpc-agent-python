@@ -23,6 +23,7 @@ import json
 import math
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -256,9 +257,30 @@ def final_text_from_content(content: Any) -> str:
         return content.strip()
     if isinstance(content, dict):
         parts = content.get("parts") or []
-        return "\n".join(str(part.get("text", "") or "") for part in parts).strip()
-    parts = getattr(content, "parts", None) or []
-    return "\n".join(str(getattr(part, "text", "") or "") for part in parts).strip()
+    else:
+        parts = getattr(content, "parts", None) or []
+    return "\n".join(
+        str((part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "")) or "")
+        for part in parts
+        if not (part.get("thought", False) if isinstance(part, dict) else getattr(part, "thought", False))
+    ).strip()
+
+
+_SENSITIVE_TRACE_ERROR_DETAIL = re.compile(
+    r"\b(?:authorization|proxy-authorization|bearer|x[-_]?api[-_]?key|api[-_ ]?key|headers?)\b",
+    re.IGNORECASE,
+)
+
+
+def safe_trace_error_message(error_message: Any) -> str | None:
+    if error_message is None:
+        return None
+    message = str(error_message).strip()
+    match = _SENSITIVE_TRACE_ERROR_DETAIL.search(message)
+    if match is None:
+        return message
+    context = message[:match.start()].rstrip(" :;,-")
+    return f"{context}: provider details redacted" if context else "provider details redacted"
 
 
 def final_text(invocation: dict[str, Any]) -> str:
@@ -659,7 +681,7 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
         for run in runs:
             run_passed = run_passed and _is_passed_status(run.final_eval_status)
             if run.error_message and error_message is None:
-                error_message = run.error_message
+                error_message = safe_trace_error_message(run.error_message)
             for metric in run.overall_eval_metric_results:
                 score = metric.score
                 metric_passed = _is_passed_status(metric.eval_status)
@@ -2130,6 +2152,13 @@ async def run_online(
     return run_dir
 
 
+def _format_delta_number(value: Any, *, signed: bool = False) -> str:
+    parsed = _finite_float(value)
+    if parsed is None:
+        return "n/a"
+    return f"{parsed:+.2f}" if signed else f"{parsed:.2f}"
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     baseline_train = report["baseline"]["train"]["score"]
     baseline_optimizer_dev = report["baseline"]["optimizer_dev"]["score"]
@@ -2172,12 +2201,18 @@ def render_markdown(report: dict[str, Any]) -> str:
             )
         )
 
-    if winner:
-        lines.extend(["", "## Validation Case Delta", ""])
-        for item in winner["case_deltas"]:
+    for candidate in sorted(report["candidates"], key=lambda item: str(item["id"])):
+        lines.extend(["", f"## Validation Case Delta: `{candidate['id']}`", ""])
+        for item in candidate["case_deltas"]:
             lines.append(
-                "- `{case_id}`: `{baseline_score:.2f}` -> `{candidate_score:.2f}` "
-                "delta `{delta:+.2f}` change_type `{change_type}`".format(**item)
+                "- `{case_id}`: `{baseline_score}` -> `{candidate_score}` "
+                "delta `{delta}` change_type `{change_type}`".format(
+                    case_id=item["case_id"],
+                    baseline_score=_format_delta_number(item.get("baseline_score")),
+                    candidate_score=_format_delta_number(item.get("candidate_score")),
+                    delta=_format_delta_number(item.get("delta"), signed=True),
+                    change_type=item["change_type"],
+                )
             )
 
     lines.extend(["", "## Failure Attribution", ""])

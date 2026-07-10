@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -281,6 +282,75 @@ def test_case_deltas_classify_pass_fail_and_score_transitions():
     assert by_id["same"]["change_type"] == "unchanged"
     assert by_id["new_fail"]["baseline_passed"] is True
     assert by_id["new_fail"]["candidate_passed"] is False
+
+
+def test_summary_omits_thoughts_and_redacts_provider_credentials_from_key_trace():
+    module = load_pipeline_module()
+    payload = load_report(EXAMPLE_DIR / "val.evalset.json")
+    case = payload["eval_cases"][0]
+    visible_final = '{"route":"faq","tool":{"name":"none","arguments":{}}}'
+    actual_invocation = SimpleNamespace(final_response={
+        "parts": [
+            {"text": "internal chain of thought", "thought": True},
+            {"text": visible_final, "thought": False},
+        ]
+    })
+    expected_invocation = SimpleNamespace(final_response={
+        "parts": [{"text": visible_final, "thought": False}]
+    })
+    run = SimpleNamespace(
+        eval_metric_result_per_invocation=[SimpleNamespace(
+            actual_invocation=actual_invocation,
+            expected_invocation=expected_invocation,
+        )],
+        final_eval_status="failed",
+        error_message="request failed: Authorization: Bearer secret-token; retry later",
+        overall_eval_metric_results=[],
+    )
+    result = SimpleNamespace(results_by_eval_set_id={
+        payload["eval_set_id"]: SimpleNamespace(
+            eval_results_by_eval_id={case["eval_id"]: [run]},
+        )
+    })
+
+    summary = module.summarize_evaluate_result(result, payload)
+    case_result = summary["case_results"][0]
+
+    assert case_result["actual_text"] == visible_final
+    assert case_result["key_trace"]["actual_final_response"] == visible_final
+    assert "internal chain of thought" not in json.dumps(case_result)
+    assert "request failed" in case_result["key_trace"]["error_message"]
+    assert "Authorization" not in json.dumps(case_result)
+    assert "Bearer" not in json.dumps(case_result)
+    assert "secret-token" not in json.dumps(case_result)
+
+
+def test_no_run_key_trace_uses_safe_shape_and_omits_thought_content():
+    module = load_pipeline_module()
+    payload = load_report(EXAMPLE_DIR / "val.evalset.json")
+    case = payload["eval_cases"][0]
+    case["conversation"][0]["final_response"] = {
+        "parts": [
+            {"text": "internal expected thought", "thought": True},
+            {"text": "visible expected final", "thought": False},
+        ]
+    }
+    result = SimpleNamespace(results_by_eval_set_id={
+        payload["eval_set_id"]: SimpleNamespace(
+            eval_results_by_eval_id={case["eval_id"]: []},
+        )
+    })
+
+    summary = module.summarize_evaluate_result(result, payload)
+    key_trace = summary["case_results"][0]["key_trace"]
+
+    assert key_trace == {
+        "invocation_id": str(case["conversation"][0]["invocation_id"]),
+        "actual_final_response": "",
+        "expected_final_response": "visible expected final",
+        "error_message": "AgentEvaluator returned no run for case",
+    }
+    assert "thought" not in json.dumps(key_trace)
 
 
 def test_build_candidate_report_rejects_case_set_mismatch():
@@ -618,6 +688,41 @@ async def test_fake_mode_generates_complete_report_and_selects_local_patch(tmp_p
     }
     module.validate_report_schema(report)
     assert (run_dir / "optimization_report.md").is_file()
+
+
+@pytest.mark.asyncio
+async def test_markdown_includes_rejected_candidate_delta_types_absent_from_winner(tmp_path: Path):
+    module = load_pipeline_module()
+    run_dir = await module.run_fake_or_trace(
+        mode="fake",
+        seed=7,
+        output_dir=tmp_path,
+        run_id="markdown_case_delta_parity",
+    )
+    report = load_report(run_dir / "optimization_report.json")
+    markdown = (run_dir / "optimization_report.md").read_text(encoding="utf-8")
+    winner = next(
+        candidate
+        for candidate in report["candidates"]
+        if candidate["id"] == report["gate_decision"]["winner"]
+    )
+    rejected = next(
+        candidate
+        for candidate in report["candidates"]
+        if candidate["id"] == "candidate_overfit"
+    )
+    rejected_types = {item["change_type"] for item in rejected["case_deltas"]}
+    winner_types = {item["change_type"] for item in winner["case_deltas"]}
+
+    assert rejected["gate"]["accepted"] is False
+    assert rejected_types - winner_types == {"new_fail"}
+    for candidate in report["candidates"]:
+        header = f"## Validation Case Delta: `{candidate['id']}`"
+        assert header in markdown
+        section = markdown.split(header, 1)[1].split("## ", 1)[0]
+        for item in candidate["case_deltas"]:
+            assert f"`{item['case_id']}`" in section
+            assert f"change_type `{item['change_type']}`" in section
 
 
 @pytest.mark.asyncio
