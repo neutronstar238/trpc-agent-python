@@ -284,7 +284,7 @@ def test_case_deltas_classify_pass_fail_and_score_transitions():
     assert by_id["new_fail"]["candidate_passed"] is False
 
 
-def test_summary_omits_thoughts_and_redacts_provider_credentials_from_key_trace():
+def test_summary_omits_thoughts_and_redacts_provider_credentials_from_report_text():
     module = load_pipeline_module()
     payload = load_report(EXAMPLE_DIR / "val.evalset.json")
     case = payload["eval_cases"][0]
@@ -298,14 +298,32 @@ def test_summary_omits_thoughts_and_redacts_provider_credentials_from_key_trace(
     expected_invocation = SimpleNamespace(final_response={
         "parts": [{"text": visible_final, "thought": False}]
     })
+    secret = "ASIA_SECRET_SESSION_TOKEN"
     run = SimpleNamespace(
         eval_metric_result_per_invocation=[SimpleNamespace(
             actual_invocation=actual_invocation,
             expected_invocation=expected_invocation,
         )],
         final_eval_status="failed",
-        error_message="request failed: Authorization: Bearer secret-token; retry later",
-        overall_eval_metric_results=[],
+        error_message=f"request failed: X-Amz-Security-Token: {secret}; retry later",
+        overall_eval_metric_results=[
+            SimpleNamespace(
+                metric_name="provider_metric",
+                score=0.0,
+                eval_status="failed",
+                details=SimpleNamespace(
+                    reason=f"provider headers: X-Amz-Security-Token: {secret}"
+                ),
+                threshold=1.0,
+            ),
+            SimpleNamespace(
+                metric_name="normal_metric",
+                score=1.0,
+                eval_status="passed",
+                details=SimpleNamespace(reason="normal evaluator explanation"),
+                threshold=1.0,
+            ),
+        ],
     )
     result = SimpleNamespace(results_by_eval_set_id={
         payload["eval_set_id"]: SimpleNamespace(
@@ -320,9 +338,32 @@ def test_summary_omits_thoughts_and_redacts_provider_credentials_from_key_trace(
     assert case_result["key_trace"]["actual_final_response"] == visible_final
     assert "internal chain of thought" not in json.dumps(case_result)
     assert "request failed" in case_result["key_trace"]["error_message"]
-    assert "Authorization" not in json.dumps(case_result)
-    assert "Bearer" not in json.dumps(case_result)
-    assert "secret-token" not in json.dumps(case_result)
+    assert case_result["metrics"]["normal_metric"]["reason"] == "normal evaluator explanation"
+    serialized_summary = json.dumps(summary)
+    assert "X-Amz-Security-Token" not in serialized_summary
+    assert secret not in serialized_summary
+
+
+@pytest.mark.parametrize(
+    "sensitive_text",
+    [
+        "Authorization: Bearer secret-token",
+        "X-Api-Key: api-key-value",
+        "access_token=access-token-value",
+        "session token=session-token-value",
+        "security-token=security-token-value",
+        "client_secret=client-secret-value",
+        "db_credential=credential-value",
+        "Set-Cookie: session=cookie-value",
+        "X-Custom-Token: custom-token-value",
+    ],
+)
+def test_sanitize_report_text_redacts_semantic_credential_markers(sensitive_text: str):
+    module = load_pipeline_module()
+
+    assert module.sanitize_report_text(f"upstream failed: {sensitive_text}") == (
+        "upstream failed: provider details redacted"
+    )
 
 
 def test_no_run_key_trace_uses_safe_shape_and_omits_thought_content():

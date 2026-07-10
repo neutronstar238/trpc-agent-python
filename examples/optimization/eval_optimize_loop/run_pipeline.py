@@ -266,17 +266,23 @@ def final_text_from_content(content: Any) -> str:
     ).strip()
 
 
-_SENSITIVE_TRACE_ERROR_DETAIL = re.compile(
-    r"\b(?:authorization|proxy-authorization|bearer|x[-_]?api[-_]?key|api[-_ ]?key|headers?)\b",
-    re.IGNORECASE,
+_SENSITIVE_REPORT_TEXT = re.compile(
+    r"""\b(?:
+        authorization|proxy-authorization|bearer|set-cookie|cookies?|headers?|
+        (?:x[-_])?api[-_]?key|api[-_ ]?key|access[-_ ]?key|
+        (?:access|session|security)[-_ ]?tokens?|
+        secrets?|credentials?|
+        (?:[a-z0-9]+[-_])+[a-z0-9_-]*(?:token|key|secret|credential)[a-z0-9_-]*
+    )\b""",
+    re.IGNORECASE | re.VERBOSE,
 )
 
 
-def safe_trace_error_message(error_message: Any) -> str | None:
-    if error_message is None:
+def sanitize_report_text(value: Any) -> str | None:
+    if value is None:
         return None
-    message = str(error_message).strip()
-    match = _SENSITIVE_TRACE_ERROR_DETAIL.search(message)
+    message = str(value).strip()
+    match = _SENSITIVE_REPORT_TEXT.search(message)
     if match is None:
         return message
     context = message[:match.start()].rstrip(" :;,-")
@@ -681,7 +687,7 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
         for run in runs:
             run_passed = run_passed and _is_passed_status(run.final_eval_status)
             if run.error_message and error_message is None:
-                error_message = safe_trace_error_message(run.error_message)
+                error_message = sanitize_report_text(run.error_message)
             for metric in run.overall_eval_metric_results:
                 score = metric.score
                 metric_passed = _is_passed_status(metric.eval_status)
@@ -696,7 +702,7 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
                     "threshold": threshold,
                     "status": _status_name(metric.eval_status),
                     "passed": metric_passed,
-                    "reason": reason,
+                    "reason": sanitize_report_text(reason),
                 }
                 if metric.metric_name == PRIMARY_METRIC and score is not None:
                     run_scores.append(float(score))
