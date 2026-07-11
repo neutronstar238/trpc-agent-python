@@ -694,6 +694,8 @@ def test_design_notes_length_is_within_issue_limit():
 def test_sample_report_is_deterministic_and_has_no_temporary_paths():
     sample = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
     assert sample["run_id"] == "sample"
+    assert "known_warning_filters" not in sample["environment_snapshot"]
+    assert "SSEDecoder._aiter_chunks close RuntimeWarning" not in json.dumps(sample)
     stable_environment = {
         "git_commit": "sample",
         "git_dirty": False,
@@ -934,6 +936,8 @@ async def test_fake_mode_generates_complete_report_and_selects_local_patch(tmp_p
     }
     assert required <= set(report)
     assert report["mode"] == "fake"
+    assert "known_warning_filters" not in report["environment_snapshot"]
+    assert "SSEDecoder._aiter_chunks close RuntimeWarning" not in json.dumps(report)
     assert report["gate_decision"]["accepted"] is True
     assert report["gate_decision"]["winner"] == "candidate_local_patch"
     assert report["baseline"]["validation"]["score"] == pytest.approx(2 / 3)

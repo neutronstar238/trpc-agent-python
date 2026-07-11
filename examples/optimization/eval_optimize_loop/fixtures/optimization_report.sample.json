@@ -2663,10 +2663,7 @@
     "base_url_host": null,
     "seed": 7,
     "command": "python examples/optimization/eval_optimize_loop/run_pipeline.py --mode fake --output-dir runs --run-id sample",
-    "config_path": "examples/optimization/eval_optimize_loop/optimizer.json",
-    "known_warning_filters": [
-      "SSEDecoder._aiter_chunks close RuntimeWarning"
-    ]
+    "config_path": "examples/optimization/eval_optimize_loop/optimizer.json"
   },
   "artifacts": {
     "optimization_report_json": "runs/sample/optimization_report.json",
