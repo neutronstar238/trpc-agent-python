@@ -12,12 +12,15 @@ import importlib.util
 import inspect
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from jsonschema import ValidationError
@@ -1532,6 +1535,144 @@ async def test_online_call_agent_closes_runner(
 
 
 @pytest.mark.asyncio
+async def test_online_call_agent_closes_runner_when_session_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_pipeline_module()
+    closed: list[bool] = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs: Any):
+            pass
+
+        async def close(self):
+            closed.append(True)
+
+    class FailingSessionService:
+        async def create_session(self, **kwargs: Any):
+            raise RuntimeError("session creation failed")
+
+    import trpc_agent_sdk.runners as runners
+    import trpc_agent_sdk.sessions as sessions
+
+    monkeypatch.setattr(runners, "Runner", FakeRunner)
+    monkeypatch.setattr(sessions, "InMemorySessionService", FailingSessionService)
+    monkeypatch.setattr(module, "_make_llm_agent_from_prompts", lambda prompt_texts: object())
+    call_agent = module.make_online_call_agent(
+        system_prompt=EXAMPLE_DIR / "agent" / "prompts" / "system.md",
+        router_prompt=EXAMPLE_DIR / "agent" / "prompts" / "router.md",
+    )
+
+    with pytest.raises(RuntimeError, match="session creation failed"):
+        await call_agent("hello")
+
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_online_call_agent_preserves_stream_error_when_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_pipeline_module()
+    closed: list[bool] = []
+    cleanup_messages: list[str] = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs: Any):
+            pass
+
+        async def run_async(self, **kwargs: Any):
+            raise RuntimeError("model stream failed")
+            yield None
+
+        async def close(self):
+            closed.append(True)
+            raise RuntimeError("runner close failed")
+
+    class FakeLogger:
+        def exception(self, message: str):
+            cleanup_messages.append(message)
+
+    import trpc_agent_sdk.runners as runners
+
+    monkeypatch.setattr(runners, "Runner", FakeRunner)
+    monkeypatch.setattr(module, "logger", FakeLogger(), raising=False)
+    monkeypatch.setattr(module, "_make_llm_agent_from_prompts", lambda prompt_texts: object())
+    call_agent = module.make_online_call_agent(
+        system_prompt=EXAMPLE_DIR / "agent" / "prompts" / "system.md",
+        router_prompt=EXAMPLE_DIR / "agent" / "prompts" / "router.md",
+    )
+
+    with pytest.raises(RuntimeError, match="model stream failed"):
+        await call_agent("hello")
+
+    assert closed == [True]
+    assert cleanup_messages == ["Failed to close online evaluation runner after a primary error."]
+
+
+@pytest.mark.asyncio
+async def test_online_call_agent_surfaces_close_failure_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_pipeline_module()
+    closed: list[bool] = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs: Any):
+            pass
+
+        async def run_async(self, **kwargs: Any):
+            if False:
+                yield None
+
+        async def close(self):
+            closed.append(True)
+            raise RuntimeError("runner close failed")
+
+    import trpc_agent_sdk.runners as runners
+
+    monkeypatch.setattr(runners, "Runner", FakeRunner)
+    monkeypatch.setattr(module, "_make_llm_agent_from_prompts", lambda prompt_texts: object())
+    call_agent = module.make_online_call_agent(
+        system_prompt=EXAMPLE_DIR / "agent" / "prompts" / "system.md",
+        router_prompt=EXAMPLE_DIR / "agent" / "prompts" / "router.md",
+    )
+
+    with pytest.raises(RuntimeError, match="runner close failed"):
+        await call_agent("hello")
+
+    assert closed == [True]
+
+
+def test_online_warning_observability_is_not_suppressed():
+    from trpc_agent_sdk.models.openai_adapter import _deepseek
+    from trpc_agent_sdk.types import GenerateContentConfig
+
+    sse_warning = "coroutine method 'aclose' of 'SSEDecoder._aiter_chunks' was never awaited"
+    with patch.object(_deepseek.logger, "warning") as warning:
+        handled, response_format = _deepseek.DeepSeekAdapter("deepseek-v4-flash").build_response_format(
+            GenerateContentConfig(
+                response_mime_type="application/json",
+                response_json_schema={"type": "object"},
+            )
+        )
+
+    assert handled is True
+    assert response_format == {"type": "json_object"}
+    warning.assert_called_once_with(
+        "DeepSeek only supports JSON object response_format; response schema is ignored."
+    )
+    assert not any(
+        action == "ignore"
+        and issubclass(RuntimeWarning, category)
+        and (message is None or message.search(sse_warning))
+        for action, message, category, _module, _line in warnings.filters
+    )
+    with pytest.warns(RuntimeWarning, match=re.escape(sse_warning)):
+        warnings.warn(sse_warning, RuntimeWarning, stacklevel=1)
+
+
+@pytest.mark.asyncio
 async def test_online_mode_can_construct_optimizer_call_without_real_api(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2284,6 +2425,15 @@ def test_online_e2e_smoke_with_real_api(tmp_path: Path):
     if missing:
         pytest.skip("missing online env vars: " + ", ".join(missing))
 
+    source_prompts = {
+        path: path.read_text(encoding="utf-8")
+        for path in (
+            EXAMPLE_DIR / "agent" / "prompts" / "system.md",
+            EXAMPLE_DIR / "agent" / "prompts" / "router.md",
+        )
+    }
+    weak_system = tmp_path / "weak_system.md"
+    weak_system.write_text(source_prompts[EXAMPLE_DIR / "agent" / "prompts" / "system.md"], encoding="utf-8")
     weak_router = tmp_path / "weak_router.md"
     weak_router.write_text(
         "\n".join([
@@ -2298,49 +2448,141 @@ def test_online_e2e_smoke_with_real_api(tmp_path: Path):
         ]),
         encoding="utf-8",
     )
+    before_weak_system = weak_system.read_text(encoding="utf-8")
     before_weak_router = weak_router.read_text(encoding="utf-8")
-    source_system = EXAMPLE_DIR / "agent" / "prompts" / "system.md"
-    before_source_system = source_system.read_text(encoding="utf-8")
     gate_config = tmp_path / "online_gate.json"
     gate_config.write_text(
         json.dumps({"max_duration_seconds": 300}),
         encoding="utf-8",
     )
 
-    proc = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_PIPELINE),
-            "--mode",
-            "online",
-            "--output-dir",
-            str(tmp_path),
-            "--run-id",
-            "online_e2e",
-            "--router-prompt",
-            str(weak_router),
-            "--gate-config",
-            str(gate_config),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    run_dir = Path(proc.stdout.strip().splitlines()[-1])
-    report = load_report(run_dir / "optimization_report.json")
-    report_markdown = (run_dir / "optimization_report.md").read_text(encoding="utf-8")
-    serialized_outputs = proc.stdout + proc.stderr + json.dumps(report) + report_markdown
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(RUN_PIPELINE),
+                "--mode",
+                "online",
+                "--output-dir",
+                str(tmp_path),
+                "--run-id",
+                "online_e2e",
+                "--system-prompt",
+                str(weak_system),
+                "--router-prompt",
+                str(weak_router),
+                "--gate-config",
+                str(gate_config),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        run_dir = Path(proc.stdout.strip().splitlines()[-1])
+        report = load_report(run_dir / "optimization_report.json")
+        report_markdown = (run_dir / "optimization_report.md").read_text(encoding="utf-8")
+        serialized_outputs = proc.stdout + proc.stderr + json.dumps(report) + report_markdown
 
-    assert report["mode"] == "online"
-    assert report["baseline"]["validation"]["score"] < report["candidates"][0]["validation"]["score"]
-    assert report["gate_decision"]["accepted"] is True
-    assert weak_router.read_text(encoding="utf-8") == before_weak_router
-    assert source_system.read_text(encoding="utf-8") == before_source_system
-    load_pipeline_module().validate_report_schema(report)
-    assert report["online_preflight"] == {
-        "TRPC_AGENT_API_KEY": True,
-        "TRPC_AGENT_BASE_URL": True,
-        "TRPC_AGENT_MODEL_NAME": True,
+        assert report["mode"] == "online"
+        assert report["baseline"]["validation"]["score"] < report["candidates"][0]["validation"]["score"]
+        assert report["gate_decision"]["accepted"] is True
+        assert weak_system.read_text(encoding="utf-8") == before_weak_system
+        assert weak_router.read_text(encoding="utf-8") == before_weak_router
+        assert all(
+            artifact["source_written"] is False
+            for candidate in [report["baseline"], *report["candidates"]]
+            for artifact in candidate["prompt_artifacts"]
+        )
+        load_pipeline_module().validate_report_schema(report)
+        assert report["online_preflight"] == {
+            "TRPC_AGENT_API_KEY": True,
+            "TRPC_AGENT_BASE_URL": True,
+            "TRPC_AGENT_MODEL_NAME": True,
+        }
+        assert os.environ["TRPC_AGENT_API_KEY"] not in serialized_outputs
+    finally:
+        assert {
+            path: path.read_text(encoding="utf-8")
+            for path in source_prompts
+        } == source_prompts
+
+
+@pytest.mark.skipif(os.getenv("RUN_ONLINE_E2E") != "1", reason="online rejection smoke is opt-in")
+def test_online_e2e_rejects_perfect_default_prompts(tmp_path: Path):
+    required = ["TRPC_AGENT_API_KEY", "TRPC_AGENT_BASE_URL", "TRPC_AGENT_MODEL_NAME"]
+    missing = [name for name in required if not os.getenv(name)]
+    if missing:
+        pytest.skip("missing online env vars: " + ", ".join(missing))
+
+    source_prompts = {
+        path: path.read_text(encoding="utf-8")
+        for path in (
+            EXAMPLE_DIR / "agent" / "prompts" / "system.md",
+            EXAMPLE_DIR / "agent" / "prompts" / "router.md",
+        )
     }
-    assert os.environ["TRPC_AGENT_API_KEY"] not in serialized_outputs
+    gate_config = tmp_path / "online_gate.json"
+    gate_config.write_text(json.dumps({"max_duration_seconds": 300}), encoding="utf-8")
+
+    def run_default(run_id: str) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(RUN_PIPELINE),
+                "--mode",
+                "online",
+                "--output-dir",
+                str(tmp_path),
+                "--run-id",
+                run_id,
+                "--gate-config",
+                str(gate_config),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        run_dir = Path(proc.stdout.strip().splitlines()[-1])
+        return proc, load_report(run_dir / "optimization_report.json")
+
+    try:
+        procs = []
+        proc, report = run_default("online_e2e_default_reject")
+        procs.append(proc)
+        reports = [report]
+        if report["baseline"]["validation"]["score"] != 1.0:
+            proc, report = run_default("online_e2e_default_reject_retry")
+            procs.append(proc)
+            reports.append(report)
+
+        candidate = report["candidates"][0]
+        serialized_outputs = "".join(
+            proc.stdout + proc.stderr
+            for proc in procs
+        ) + "".join(
+            json.dumps(run_report)
+            + (tmp_path / run_report["run_id"] / "optimization_report.md").read_text(encoding="utf-8")
+            for run_report in reports
+        )
+
+        assert report["baseline"]["validation"]["score"] == 1.0
+        assert candidate["validation"]["score"] == 1.0
+        assert report["gate_decision"]["accepted"] is False
+        assert any(
+            "validation score did not improve over baseline" in reason
+            for reason in report["gate_decision"]["reasons"]
+        )
+        assert all(
+            artifact["source_written"] is False
+            for candidate_report in [report["baseline"], *report["candidates"]]
+            for artifact in candidate_report["prompt_artifacts"]
+        )
+        load_pipeline_module().validate_report_schema(report)
+        assert os.environ["TRPC_AGENT_API_KEY"] not in serialized_outputs
+    finally:
+        assert {
+            path: path.read_text(encoding="utf-8")
+            for path in source_prompts
+        } == source_prompts

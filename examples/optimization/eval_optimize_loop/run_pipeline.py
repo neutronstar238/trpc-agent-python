@@ -44,6 +44,8 @@ if str(REPO_ROOT) not in sys.path:
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+from trpc_agent_sdk.log import logger
+
 
 TRAIN_PATH = HERE / "train.evalset.json"
 OPTIMIZER_DEV_PATH = HERE / "optimizer_dev.evalset.json"
@@ -2037,14 +2039,14 @@ def make_online_call_agent(
         )
         user_id = "optimizer"
         session_id = str(uuid.uuid4())
-        await session_service.create_session(
-            app_name="support_router_optimizer",
-            user_id=user_id,
-            session_id=session_id,
-            state={},
-        )
-        final = ""
         try:
+            await session_service.create_session(
+                app_name="support_router_optimizer",
+                user_id=user_id,
+                session_id=session_id,
+                state={},
+            )
+            final = ""
             async for event in runner.run_async(
                 user_id=user_id,
                 session_id=session_id,
@@ -2057,7 +2059,13 @@ def make_online_call_agent(
                         continue
                     if part.text:
                         final += part.text
-        finally:
+        except BaseException:
+            try:
+                await runner.close()
+            except BaseException:
+                logger.exception("Failed to close online evaluation runner after a primary error.")
+            raise
+        else:
             await runner.close()
         return final.strip()
 
