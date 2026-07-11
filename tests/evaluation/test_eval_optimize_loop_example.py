@@ -110,12 +110,15 @@ async def _run_stubbed_online(
     result: SimpleNamespace,
     run_id: str,
     gate_config: dict[str, Any] | None = None,
+    optimizer_agent_calls: int = 0,
 ) -> dict[str, Any]:
     monkeypatch.setenv("TRPC_AGENT_API_KEY", "fake-key")
     monkeypatch.setenv("TRPC_AGENT_BASE_URL", "http://localhost/fake")
     monkeypatch.setenv("TRPC_AGENT_MODEL_NAME", "fake-model")
 
     async def fake_optimize(**kwargs: Any) -> SimpleNamespace:
+        for _ in range(optimizer_agent_calls):
+            await kwargs["call_agent"]("optimizer candidate")
         output_dir = Path(kwargs["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "result.json").write_text("{}", encoding="utf-8")
@@ -137,6 +140,12 @@ async def _run_stubbed_online(
 
     import trpc_agent_sdk.evaluation as evaluation_pkg
 
+    if optimizer_agent_calls:
+
+        async def fake_call_agent(_: str) -> str:
+            return "{}"
+
+        monkeypatch.setattr(module, "make_online_call_agent", lambda **_: fake_call_agent)
     monkeypatch.setattr(evaluation_pkg.AgentOptimizer, "optimize", staticmethod(fake_optimize))
     monkeypatch.setattr(module, "run_evaluator", fake_run_evaluator)
     run_dir = await module.run_online(
@@ -278,6 +287,135 @@ def test_gate_rejects_malformed_numeric_evidence_without_raising(
         gate_config=gate_config,
         duration_seconds=duration_seconds,
         cost_usd=cost_usd,
+    )
+
+    assert result["accepted"] is False
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    ("gate_config", "baseline_case", "candidate_case", "reason"),
+    [
+        (
+            {"allow_new_hard_fails": "false", "required_metrics": [ROUTE_TOOL_ARGS_METRIC]},
+            {"case_id": "a", "score": 0.25, "passed": True, "tags": []},
+            {"case_id": "a", "score": 0.75, "passed": False, "tags": []},
+            "hard fail",
+        ),
+        (
+            {"allow_critical_regression": "false", "required_metrics": [ROUTE_TOOL_ARGS_METRIC]},
+            {"case_id": "a", "score": 1.0, "passed": True, "tags": ["critical"]},
+            {"case_id": "a", "score": 0.75, "passed": True, "tags": ["critical"]},
+            "critical",
+        ),
+    ],
+)
+def test_gate_allow_flags_require_exact_booleans(
+    gate_config: dict[str, Any],
+    baseline_case: dict[str, Any],
+    candidate_case: dict[str, Any],
+    reason: str,
+):
+    module = load_pipeline_module()
+    result = module.apply_gate(
+        candidate_id="invalid_allow_flag",
+        baseline_val=_gate_summary(0.25, [baseline_case]),
+        candidate_val=_gate_summary(0.75, [candidate_case]),
+        gate_config=gate_config,
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+
+    assert result["accepted"] is False
+    assert reason in " ".join(result["reasons"])
+    assert "boolean" in " ".join(result["reasons"])
+
+
+@pytest.mark.parametrize(
+    "required_metrics",
+    [1, True, {}, [""], [" "], ["metric", "metric"], ["metric", 1], [["metric"]]],
+)
+def test_gate_rejects_invalid_required_metrics_without_raising(required_metrics: Any):
+    module = load_pipeline_module()
+    result = module.apply_gate(
+        candidate_id="invalid_required_metrics",
+        baseline_val=_gate_summary(0.25, [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}]),
+        candidate_val=_gate_summary(0.75, [{"case_id": "a", "score": 0.75, "passed": True, "tags": []}]),
+        gate_config={"required_metrics": required_metrics},
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+
+    assert result["accepted"] is False
+    assert "required_metrics" in " ".join(result["reasons"])
+    json.dumps(result, allow_nan=False)
+
+
+def test_gate_rejects_all_required_metrics_when_evidence_is_empty():
+    module = load_pipeline_module()
+    candidate = _gate_summary(0.75, [{"case_id": "a", "score": 0.75, "passed": True, "tags": []}])
+    candidate["metrics"] = {}
+
+    result = module.apply_gate(
+        candidate_id="empty_all_metrics",
+        baseline_val=_gate_summary(0.25, [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}]),
+        candidate_val=candidate,
+        gate_config={"required_metrics": "all"},
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+
+    assert result["accepted"] is False
+    assert "required_metrics" in " ".join(result["reasons"])
+
+
+@pytest.mark.parametrize(
+    ("duration", "cost", "gate_config"),
+    [
+        (-1.0, 0.0, {}),
+        (1.0, -1.0, {}),
+        (1.0, 0.0, {"max_cost_usd": -1.0}),
+        (1.0, 0.0, {"max_duration_seconds": -1.0}),
+    ],
+)
+def test_gate_rejects_negative_observed_values_and_budgets(
+    duration: float,
+    cost: float,
+    gate_config: dict[str, Any],
+):
+    module = load_pipeline_module()
+    result = module.apply_gate(
+        candidate_id="negative_budget_evidence",
+        baseline_val=_gate_summary(0.25, [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}]),
+        candidate_val=_gate_summary(0.75, [{"case_id": "a", "score": 0.75, "passed": True, "tags": []}]),
+        gate_config={"required_metrics": [ROUTE_TOOL_ARGS_METRIC], **gate_config},
+        duration_seconds=duration,
+        cost_usd=cost,
+    )
+
+    assert result["accepted"] is False
+    assert "non-negative" in " ".join(result["reasons"])
+
+
+@pytest.mark.parametrize(
+    "candidate_case",
+    [
+        {"case_id": 1, "score": 0.75, "passed": True, "tags": []},
+        {"case_id": " ", "score": 0.75, "passed": True, "tags": []},
+        {"case_id": "a", "score": -0.01, "passed": True, "tags": []},
+        {"case_id": "a", "score": 1.01, "passed": True, "tags": []},
+        {"case_id": "a", "score": 0.75, "passed": True, "tags": ("critical",)},
+    ],
+)
+def test_gate_rejects_malformed_case_evidence_with_json_safe_result(candidate_case: dict[str, Any]):
+    module = load_pipeline_module()
+    result = module.apply_gate(
+        candidate_id="malformed_case_evidence",
+        baseline_val=_gate_summary(0.25, [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}]),
+        candidate_val=_gate_summary(0.75, [candidate_case]),
+        gate_config={"required_metrics": [ROUTE_TOOL_ARGS_METRIC]},
+        duration_seconds=1.0,
+        cost_usd=0.0,
     )
 
     assert result["accepted"] is False
@@ -548,6 +686,41 @@ def test_sanitize_report_text_redacts_semantic_credential_markers(sensitive_text
     )
 
 
+@pytest.mark.parametrize(
+    "sensitive_text",
+    [
+        "https://user:password@provider.example/v1?api_key=fake-secret",
+        "http://provider.example/v1/models",
+        "sk-fake0123456789abcdefghijklmnopqrstuvwxyz",
+    ],
+)
+def test_sanitize_report_text_redacts_urls_and_standalone_provider_keys(sensitive_text: str):
+    module = load_pipeline_module()
+    sanitized = module.sanitize_report_text(f"request failed while calling {sensitive_text}")
+
+    assert sanitized == "request failed while calling: provider details redacted"
+    assert sensitive_text not in sanitized
+
+
+def test_sanitize_report_text_redacts_exact_configured_provider_values(monkeypatch: pytest.MonkeyPatch):
+    configured_key = "configured-fake-key-value"
+    configured_url = "provider.internal.example/v1/fake"
+    monkeypatch.setenv("TRPC_AGENT_API_KEY", configured_key)
+    monkeypatch.setenv("TRPC_AGENT_BASE_URL", configured_url)
+    module = load_pipeline_module()
+
+    for configured_value in (configured_key, configured_url):
+        sanitized = module.sanitize_report_text(f"connection failed at {configured_value}")
+        assert sanitized == "connection failed at: provider details redacted"
+        assert configured_value not in sanitized
+
+
+def test_sanitize_report_text_preserves_ordinary_error_context():
+    module = load_pipeline_module()
+    message = "optimizer rejected round 2 because validation score decreased"
+    assert module.sanitize_report_text(message) == message
+
+
 def test_no_run_key_trace_uses_safe_shape_and_omits_thought_content():
     module = load_pipeline_module()
     payload = load_report(EXAMPLE_DIR / "val.evalset.json")
@@ -755,6 +928,98 @@ def patch_agent_evaluator(
 
     monkeypatch.setattr(evaluation_pkg.AgentEvaluator, "get_executer", staticmethod(fake_get_executer))
     return calls
+
+
+def _copy_public_evalsets(tmp_path: Path) -> tuple[Path, Path, Path]:
+    paths = []
+    for name in ("train.evalset.json", "optimizer_dev.evalset.json", "val.evalset.json"):
+        target = tmp_path / name
+        shutil.copyfile(EXAMPLE_DIR / name, target)
+        paths.append(target)
+    return tuple(paths)  # type: ignore[return-value]
+
+
+def test_validate_inputs_accepts_distinct_public_evalset_copies(tmp_path: Path):
+    module = load_pipeline_module()
+    module.validate_inputs(*_copy_public_evalsets(tmp_path))
+
+
+def test_validate_inputs_rejects_byte_identical_copies(tmp_path: Path):
+    module = load_pipeline_module()
+    train, optimizer_dev, validation = _copy_public_evalsets(tmp_path)
+    shutil.copyfile(train, optimizer_dev)
+
+    with pytest.raises(ValueError, match="byte-identical"):
+        module.validate_inputs(train, optimizer_dev, validation)
+
+
+def test_validate_inputs_rejects_hardlinks_when_supported(tmp_path: Path):
+    module = load_pipeline_module()
+    train, _, validation = _copy_public_evalsets(tmp_path)
+    optimizer_dev = tmp_path / "optimizer_dev_hardlink.evalset.json"
+    try:
+        os.link(train, optimizer_dev)
+    except OSError as error:
+        pytest.skip(f"hardlinks unavailable: {error}")
+
+    with pytest.raises(ValueError, match="same file"):
+        module.validate_inputs(train, optimizer_dev, validation)
+
+
+def test_validate_inputs_rejects_same_target_symlinks_when_supported(tmp_path: Path):
+    module = load_pipeline_module()
+    train, _, validation = _copy_public_evalsets(tmp_path)
+    optimizer_dev = tmp_path / "optimizer_dev_symlink.evalset.json"
+    try:
+        optimizer_dev.symlink_to(train)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    with pytest.raises(ValueError, match="same file"):
+        module.validate_inputs(train, optimizer_dev, validation)
+
+
+@pytest.mark.parametrize("overlap", ["id", "input", "gold"])
+def test_validate_inputs_rejects_pairwise_semantic_overlap(tmp_path: Path, overlap: str):
+    module = load_pipeline_module()
+    train, optimizer_dev, validation = _copy_public_evalsets(tmp_path)
+    train_payload = json.loads(train.read_text(encoding="utf-8"))
+    dev_payload = json.loads(optimizer_dev.read_text(encoding="utf-8"))
+    train_case = train_payload["eval_cases"][0]
+    dev_case = dev_payload["eval_cases"][0]
+    if overlap == "id":
+        dev_case["eval_id"] = train_case["eval_id"]
+    elif overlap == "input":
+        source = train_case["conversation"][0]["user_content"]["parts"][0]["text"]
+        dev_case["conversation"][0]["user_content"]["parts"][0]["text"] = f"  {source.upper()}  "
+    else:
+        dev_case["conversation"][0]["final_response"]["parts"] = copy.deepcopy(
+            train_case["conversation"][0]["final_response"]["parts"]
+        )
+        dev_case["conversation"][0]["final_response"]["role"] = "different-metadata"
+    optimizer_dev.write_text(json.dumps(dev_payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=overlap):
+        module.validate_inputs(train, optimizer_dev, validation)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"eval_cases": "invalid"},
+        {"eval_cases": [{}]},
+        {"eval_cases": [{"eval_id": "x", "conversation": []}]},
+    ],
+)
+def test_validate_inputs_rejects_invalid_evalset_shapes(tmp_path: Path, payload: Any):
+    module = load_pipeline_module()
+    train, optimizer_dev, validation = _copy_public_evalsets(tmp_path)
+    optimizer_dev.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="optimizer_dev evalset"):
+        module.validate_inputs(train, optimizer_dev, validation)
 
 
 def test_directory_layout_and_assets_exist():
@@ -1010,14 +1275,83 @@ def test_report_schema_rejects_nonfinite_numbers(
 def test_report_schema_requires_numeric_delta_for_accepted_gate():
     module = load_pipeline_module()
     report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
-    report["candidates"][0]["gate"]["accepted"] = True
-    report["candidates"][0]["gate"]["validation_delta"] = None
+    accepted_candidate = next(candidate for candidate in report["candidates"] if candidate["gate"]["accepted"])
+    accepted_candidate["gate"]["validation_delta"] = None
 
     with pytest.raises(ValidationError):
         module.validate_report_schema(report)
 
-    report["candidates"][0]["gate"]["accepted"] = False
+    accepted_candidate["gate"]["validation_delta"] = accepted_candidate["delta"]["validation_score"]
+    rejected_candidate = next(candidate for candidate in report["candidates"] if not candidate["gate"]["accepted"])
+    rejected_candidate["gate"]["validation_delta"] = None
     module.validate_report_schema(report)
+
+
+@pytest.mark.parametrize(
+    "contradiction",
+    [
+        "accepted_without_winner",
+        "accepted_unknown_winner",
+        "rejected_with_winner",
+        "rejected_with_accepted_candidate",
+        "accepted_nonpositive_delta",
+        "candidate_gate_id_mismatch",
+        "baseline_validation_alias_mismatch",
+        "candidate_validation_alias_mismatch",
+        "winner_delta_mismatch",
+        "winner_reasons_mismatch",
+        "rejected_nonzero_delta",
+        "top_level_model_call_sum_mismatch",
+        "optimizer_model_call_sum_mismatch",
+        "final_model_call_sum_mismatch",
+        "token_total_mismatch",
+    ],
+)
+def test_report_semantic_validation_rejects_contradictions(contradiction: str):
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    winner = next(candidate for candidate in report["candidates"] if candidate["gate"]["accepted"])
+    if contradiction == "accepted_without_winner":
+        report["gate_decision"]["winner"] = None
+    elif contradiction == "accepted_unknown_winner":
+        report["gate_decision"]["winner"] = "missing_candidate"
+    elif contradiction == "rejected_with_winner":
+        report["gate_decision"]["accepted"] = False
+    elif contradiction == "rejected_with_accepted_candidate":
+        report["gate_decision"] = {"accepted": False, "winner": None, "reasons": ["rejected"]}
+        report["delta"] = {"train_score": 0.0, "optimizer_dev_score": 0.0, "validation_score": 0.0}
+    elif contradiction == "accepted_nonpositive_delta":
+        winner["gate"]["validation_delta"] = 0.0
+    elif contradiction == "candidate_gate_id_mismatch":
+        winner["gate"]["candidate_id"] = "different_candidate"
+    elif contradiction == "baseline_validation_alias_mismatch":
+        report["baseline"]["validation"] = copy.deepcopy(report["baseline"]["validation"])
+        report["baseline"]["validation"]["score"] = 0.0
+    elif contradiction == "candidate_validation_alias_mismatch":
+        winner["validation"] = copy.deepcopy(winner["validation"])
+        winner["validation"]["score"] = 0.0
+    elif contradiction == "winner_delta_mismatch":
+        report["delta"]["validation_score"] = 0.25
+    elif contradiction == "winner_reasons_mismatch":
+        report["gate_decision"]["reasons"] = ["different reason"]
+    elif contradiction == "rejected_nonzero_delta":
+        report["gate_decision"] = {"accepted": False, "winner": None, "reasons": ["rejected"]}
+        for candidate in report["candidates"]:
+            candidate["gate"]["accepted"] = False
+        report["delta"]["validation_score"] = 0.25
+    elif contradiction == "top_level_model_call_sum_mismatch":
+        report["cost"]["model_calls"] = 1
+    elif contradiction == "optimizer_model_call_sum_mismatch":
+        report["cost"]["optimizer"]["model_calls"] = 1
+        report["cost"]["model_calls"] = 1
+    elif contradiction == "final_model_call_sum_mismatch":
+        report["cost"]["final_revalidation"]["model_calls"] = 1
+        report["cost"]["model_calls"] = 1
+    else:
+        report["cost"]["token_usage"]["total"] = 1
+
+    with pytest.raises(ValidationError):
+        module.validate_report_schema(report)
 
 
 def test_report_schema_requires_candidate_audit_and_optimization_rounds():
@@ -1099,6 +1433,7 @@ def test_report_schema_allows_empty_no_run_case_metrics():
     module = load_pipeline_module()
     report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
     report["baseline"]["validation"]["case_results"][0]["metrics"] = {}
+    report["baseline"]["final_validation"]["case_results"][0]["metrics"] = {}
 
     module.validate_report_schema(report)
 
@@ -1143,6 +1478,10 @@ def test_report_schema_rejects_unknown_root_properties(name: str):
         (("run_id",), "../escape"),
         (("candidates", 0, "id"), "nested/candidate"),
         (("candidates", 0, "gate", "candidate_id"), "C:\\absolute"),
+        (("run_id",), "CON"),
+        (("run_id",), "nul.txt"),
+        (("candidates", 0, "id"), "Com1.json"),
+        (("candidates", 0, "gate", "candidate_id"), "LPT9.log"),
     ],
 )
 def test_report_schema_rejects_unsafe_artifact_identifiers(
@@ -1162,7 +1501,20 @@ def test_report_schema_rejects_unsafe_artifact_identifiers(
 
 @pytest.mark.parametrize(
     "run_id",
-    ["", ".", "..", "../escape", "nested/run", "nested\\run", "/absolute", "C:\\absolute"],
+    [
+        "",
+        ".",
+        "..",
+        "../escape",
+        "nested/run",
+        "nested\\run",
+        "/absolute",
+        "C:\\absolute",
+        "CON",
+        "nul.txt",
+        "Com1.json",
+        "LPT9.log",
+    ],
 )
 def test_make_run_dir_rejects_unsafe_single_path_components(tmp_path: Path, run_id: str):
     module = load_pipeline_module()
@@ -2443,6 +2795,41 @@ def test_optimizer_round_audit_normalizes_prompt_keys_without_path_collisions(
     }
 
 
+@pytest.mark.parametrize("reserved_name", ["CON", "nul.txt", "Com1.json", "LPT9.log"])
+def test_optimizer_round_audit_normalizes_reserved_prompt_filenames(
+    tmp_path: Path,
+    reserved_name: str,
+):
+    module = load_pipeline_module()
+    records = module.write_optimizer_round_artifacts(
+        run_dir=tmp_path,
+        rounds=[
+            SimpleNamespace(
+                round=1,
+                optimized_field_names=[],
+                candidate_prompts={reserved_name: "prompt"},
+                validation_pass_rate=1.0,
+                metric_breakdown={},
+                accepted=True,
+                acceptance_reason="accepted",
+                skip_reason=None,
+                error_message=None,
+                failed_case_ids=[],
+                round_llm_cost=0.0,
+                round_token_usage={"prompt": 0, "completion": 0, "total": 0},
+                duration_seconds=0.0,
+            )
+        ],
+    )
+    record = records[0]
+
+    assert record["accepted"] is False
+    assert "prompt artifact key" in record["decision_reason"]
+    assert all(
+        Path(path).stem.casefold() != Path(reserved_name).stem.casefold() for path in record["prompt_paths"].values()
+    )
+
+
 @pytest.mark.parametrize("candidate_prompts", [None, ["not a mapping"]])
 def test_optimizer_round_audit_normalizes_malformed_prompt_payloads(
     tmp_path: Path,
@@ -2592,16 +2979,70 @@ def test_online_cost_audit_distinguishes_optimizer_tokens_from_pipeline_tokens()
     module = load_pipeline_module()
     audit = module.online_cost_audit(
         _optimizer_result({"prompt": 8, "completion": 2, "total": 10}),
+        optimizer_candidate_agent_calls=2,
         final_revalidation_calls={"agent_calls": 6, "judge_model_calls": 6, "model_calls": 12},
     )
 
-    assert audit["optimizer"]["token_usage"] == {"prompt": 8, "completion": 2, "total": 10}
-    assert audit["optimizer"]["token_usage_known"] is True
+    assert audit["optimizer"]["candidate_evaluation_agent_calls"] == 2
+    assert audit["optimizer"]["model_calls"] == 3
+    assert audit["optimizer"]["token_usage"] is None
+    assert audit["optimizer"]["token_usage_known"] is False
+    assert audit["optimizer"]["estimated_cost"] is None
+    assert audit["optimizer"]["reflection_reported_usage"] == {
+        "estimated_cost": 0.01,
+        "token_usage": {"prompt": 8, "completion": 2, "total": 10},
+        "token_usage_known": True,
+        "unknown_token_usage_reason": None,
+    }
     assert audit["final_revalidation"]["token_usage"] is None
     assert audit["final_revalidation"]["token_usage_known"] is False
     assert audit["token_usage"] is None
     assert audit["token_usage_known"] is False
-    assert audit["model_calls"] == 13
+    assert audit["model_calls"] == 15
+
+
+def test_online_cost_audit_rejects_noninteger_native_call_counters():
+    module = load_pipeline_module()
+    result = _optimizer_result({"prompt": 8, "completion": 2, "total": 10})
+    result.total_reflection_lm_calls = 1.0
+
+    audit = module.online_cost_audit(
+        result,
+        optimizer_candidate_agent_calls=0,
+        final_revalidation_calls={"agent_calls": 0, "judge_model_calls": 0, "model_calls": 0},
+    )
+
+    assert audit["optimizer"]["reflection_lm_calls"] == 0
+    assert audit["optimizer"]["usage_evidence_valid"] is False
+    assert audit["optimizer"]["token_usage_known"] is False
+    assert audit["optimizer"]["token_usage"] is None
+
+
+@pytest.mark.asyncio
+async def test_online_optimizer_candidate_agent_calls_are_instrumented(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_pipeline_module()
+    report = await _run_stubbed_online(
+        module=module,
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        result=_optimizer_result({"prompt": 8, "completion": 2, "total": 10}),
+        run_id="counted_optimizer_agent_calls",
+        gate_config={"max_cost_usd": 1.0, "required_metrics": [ROUTE_TOOL_ARGS_METRIC]},
+        optimizer_agent_calls=2,
+    )
+
+    optimizer = report["cost"]["optimizer"]
+    assert optimizer["candidate_evaluation_agent_calls"] == 2
+    assert optimizer["model_calls"] == 3
+    assert optimizer["token_usage_known"] is False
+    assert report["cost"]["model_calls"] == (
+        optimizer["model_calls"] + report["cost"]["final_revalidation"]["model_calls"]
+    )
+    assert report["gate_decision"]["accepted"] is False
+    module.validate_report_schema(report)
 
 
 @pytest.mark.asyncio
@@ -2618,14 +3059,15 @@ async def test_online_malformed_optimizer_usage_writes_rejected_schema_valid_rep
         run_id="malformed_optimizer_usage",
     )
 
-    assert report["cost"]["optimizer"]["token_usage"] == {
+    assert report["cost"]["optimizer"]["token_usage"] is None
+    assert report["cost"]["optimizer"]["reflection_reported_usage"]["token_usage"] == {
         "prompt": 0,
         "completion": 0,
         "total": 0,
     }
     assert report["cost"]["optimizer"]["token_usage_known"] is False
     assert report["gate_decision"]["accepted"] is False
-    assert "token usage" in " ".join(report["gate_decision"]["reasons"])
+    assert "usage evidence" in " ".join(report["gate_decision"]["reasons"])
     module.validate_report_schema(report)
 
 

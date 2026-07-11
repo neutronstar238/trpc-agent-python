@@ -2613,6 +2613,7 @@
     "optimizer": {
       "estimated_cost": 0.0,
       "model_calls": 0,
+      "candidate_evaluation_agent_calls": 0,
       "reflection_lm_calls": 0,
       "judge_model_calls": 0,
       "token_usage": {
@@ -2621,7 +2622,18 @@
         "total": 0
       },
       "token_usage_known": true,
-      "unknown_token_usage_reason": null
+      "unknown_token_usage_reason": null,
+      "usage_evidence_valid": true,
+      "reflection_reported_usage": {
+        "estimated_cost": 0.0,
+        "token_usage": {
+          "prompt": 0,
+          "completion": 0,
+          "total": 0
+        },
+        "token_usage_known": true,
+        "unknown_token_usage_reason": null
+      }
     },
     "final_revalidation": {
       "estimated_cost": 0.0,

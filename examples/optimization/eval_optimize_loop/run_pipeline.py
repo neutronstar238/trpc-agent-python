@@ -104,6 +104,14 @@ DEFAULT_GATE_CONFIG = {
 
 SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?$")
 TOKEN_USAGE_KEYS = ("prompt", "completion", "total")
+WINDOWS_RESERVED_BASENAMES = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -132,6 +140,81 @@ def validate_report_schema(report: dict[str, Any]) -> None:
     reject_nonfinite_numbers(report)
     schema = load_json(REPORT_SCHEMA_PATH)
     Draft202012Validator(schema).validate(report)
+
+    def reject(message: str) -> None:
+        raise ValidationError(message)
+
+    if _is_windows_reserved_name(report.get("run_id")):
+        reject("run_id uses a Windows reserved device basename")
+
+    baseline = report["baseline"]
+    if baseline["validation"] != baseline["final_validation"]:
+        reject("baseline validation must equal final_validation")
+
+    candidates_by_id: dict[str, dict[str, Any]] = {}
+    accepted_candidates: list[dict[str, Any]] = []
+    for candidate in report["candidates"]:
+        candidate_id = candidate["id"]
+        if _is_windows_reserved_name(candidate_id):
+            reject("candidate id uses a Windows reserved device basename")
+        if candidate["gate"]["candidate_id"] != candidate_id:
+            reject("candidate gate candidate_id must equal candidate id")
+        if candidate["validation"] != candidate["final_validation"]:
+            reject("candidate validation must equal final_validation")
+        if candidate["gate"]["accepted"]:
+            if candidate["gate"]["validation_delta"] <= 0:
+                reject("accepted candidate validation delta must be strictly positive")
+            accepted_candidates.append(candidate)
+        candidates_by_id[candidate_id] = candidate
+
+    decision = report["gate_decision"]
+    if decision["accepted"]:
+        winner_id = decision["winner"]
+        winner = candidates_by_id.get(winner_id)
+        if winner is None or not winner["gate"]["accepted"]:
+            reject("accepted gate decision must name an existing accepted candidate")
+        if report["delta"] != winner["delta"]:
+            reject("top-level delta must equal winning candidate delta")
+        if decision["reasons"] != winner["gate"]["reasons"]:
+            reject("top-level reasons must equal winning candidate gate reasons")
+    else:
+        if decision["winner"] is not None:
+            reject("rejected gate decision must not name a winner")
+        if accepted_candidates:
+            reject("rejected report must not contain an accepted candidate")
+        if any(value != 0 for value in report["delta"].values()):
+            reject("rejected report must retain the zero-delta contract")
+
+    cost = report["cost"]
+    optimizer_cost = cost["optimizer"]
+    expected_optimizer_calls = (
+        optimizer_cost["candidate_evaluation_agent_calls"]
+        + optimizer_cost["reflection_lm_calls"]
+        + optimizer_cost["judge_model_calls"]
+    )
+    if optimizer_cost["model_calls"] != expected_optimizer_calls:
+        reject("optimizer model_calls must equal candidate, reflection, and judge calls")
+    final_cost = cost["final_revalidation"]
+    if final_cost["model_calls"] != final_cost["agent_calls"] + final_cost["judge_model_calls"]:
+        reject("final revalidation model_calls must equal agent plus judge calls")
+    expected_model_calls = cost["optimizer"]["model_calls"] + cost["final_revalidation"]["model_calls"]
+    if cost["model_calls"] != expected_model_calls:
+        reject("top-level model_calls must equal optimizer plus final revalidation calls")
+
+    def validate_token_totals(value: Any) -> None:
+        if isinstance(value, dict):
+            if set(value) == set(TOKEN_USAGE_KEYS) and all(
+                isinstance(value[key], int) and not isinstance(value[key], bool) for key in TOKEN_USAGE_KEYS
+            ):
+                if value["total"] != value["prompt"] + value["completion"]:
+                    reject("token usage total must equal prompt plus completion")
+            for nested in value.values():
+                validate_token_totals(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                validate_token_totals(nested)
+
+    validate_token_totals(report)
 
 
 def sha256_text(text: str) -> str:
@@ -239,6 +322,8 @@ def _normalized_prompt_artifact_key(
         normalized_name = f"prompt_{type(name).__name__}"
     if not normalized_name or normalized_name in {".", ".."}:
         normalized_name = "prompt"
+    if _is_windows_reserved_name(normalized_name):
+        normalized_name = f"prompt_{normalized_name}"
 
     base_name = normalized_name
     suffix = 2
@@ -544,16 +629,27 @@ _SENSITIVE_REPORT_TEXT = re.compile(
     )\b""",
     re.IGNORECASE | re.VERBOSE,
 )
+_PROVIDER_URL = re.compile(r"https?://\S+", re.IGNORECASE)
+_STANDALONE_PROVIDER_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b", re.IGNORECASE)
 
 
 def sanitize_report_text(value: Any) -> str | None:
     if value is None:
         return None
     message = str(value).strip()
-    match = _SENSITIVE_REPORT_TEXT.search(message)
-    if match is None:
+    sensitive_starts = [
+        match.start()
+        for pattern in (_SENSITIVE_REPORT_TEXT, _PROVIDER_URL, _STANDALONE_PROVIDER_KEY)
+        for match in [pattern.search(message)]
+        if match is not None
+    ]
+    for variable in ("TRPC_AGENT_API_KEY", "TRPC_AGENT_BASE_URL"):
+        configured_value = os.getenv(variable)
+        if configured_value and configured_value in message:
+            sensitive_starts.append(message.index(configured_value))
+    if not sensitive_starts:
         return message
-    context = message[: match.start()].rstrip(" :;,-")
+    context = message[: min(sensitive_starts)].rstrip(" :;,-")
     return f"{context}: provider details redacted" if context else "provider details redacted"
 
 
@@ -608,20 +704,89 @@ def load_gate_config(
 
 
 def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalset: Path) -> None:
-    resolved = {
-        "train": train_evalset.resolve(),
-        "optimizer_dev": optimizer_dev_evalset.resolve(),
-        "final_validation": val_evalset.resolve(),
+    paths = {
+        "train": train_evalset,
+        "optimizer_dev": optimizer_dev_evalset,
+        "final_validation": val_evalset,
     }
-    if len(set(resolved.values())) != len(resolved):
-        raise ValueError("train, optimizer_dev, and final validation evalsets must be physically separate files")
-    for path in (train_evalset, optimizer_dev_evalset, val_evalset):
+    for path in paths.values():
         if not path.is_file():
             raise FileNotFoundError(path)
 
+    role_pairs = (("train", "optimizer_dev"), ("train", "final_validation"), ("optimizer_dev", "final_validation"))
+    for left_role, right_role in role_pairs:
+        left = paths[left_role]
+        right = paths[right_role]
+        if left.resolve() == right.resolve() or os.path.samefile(left, right):
+            raise ValueError(f"{left_role} and {right_role} evalsets resolve to the same file")
+        if sha256_file(left) == sha256_file(right):
+            raise ValueError(f"{left_role} and {right_role} evalsets are byte-identical copies")
+
+    evidence: dict[str, dict[str, set[str]]] = {}
+    for role, path in paths.items():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"{role} evalset must be valid UTF-8 JSON: {error}") from error
+        if not isinstance(payload, dict) or not isinstance(payload.get("eval_cases"), list):
+            raise ValueError(f"{role} evalset must be an object with an eval_cases array")
+        role_evidence = {"id": set(), "input": set(), "gold": set()}
+        for position, case in enumerate(payload["eval_cases"]):
+            prefix = f"{role} evalset eval_cases[{position}]"
+            if not isinstance(case, dict):
+                raise ValueError(f"{prefix} must be an object")
+            case_id = case.get("eval_id")
+            conversation = case.get("conversation")
+            if not isinstance(case_id, str) or not case_id.strip():
+                raise ValueError(f"{prefix}.eval_id must be a non-empty string")
+            if not isinstance(conversation, list) or not conversation or not isinstance(conversation[0], dict):
+                raise ValueError(f"{prefix}.conversation must be a non-empty array of objects")
+            invocation = conversation[0]
+            user_content = invocation.get("user_content")
+            final_response = invocation.get("final_response")
+            if not isinstance(user_content, dict) or not isinstance(user_content.get("parts"), list):
+                raise ValueError(f"{prefix} must contain user_content.parts as an array")
+            if not isinstance(final_response, dict) or not isinstance(final_response.get("parts"), list):
+                raise ValueError(f"{prefix} must contain final_response.parts as an array")
+            user_parts = user_content["parts"]
+            gold_parts = final_response["parts"]
+            if not user_parts or not all(
+                isinstance(part, dict) and isinstance(part.get("text"), str) for part in user_parts
+            ):
+                raise ValueError(f"{prefix} user_content.parts must contain text strings")
+            if not gold_parts or not all(
+                isinstance(part, dict) and isinstance(part.get("text"), str) for part in gold_parts
+            ):
+                raise ValueError(f"{prefix} final_response.parts must contain text strings")
+            normalized_input = " ".join("".join(part["text"] for part in user_parts).split()).casefold()
+            exact_gold = json.dumps(
+                [part["text"] for part in gold_parts],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            if not normalized_input:
+                raise ValueError(f"{prefix} normalized user input must be non-empty")
+            role_evidence["id"].add(case_id)
+            role_evidence["input"].add(normalized_input)
+            role_evidence["gold"].add(exact_gold)
+        evidence[role] = role_evidence
+
+    for left_role, right_role in role_pairs:
+        for evidence_type in ("id", "input", "gold"):
+            overlap = evidence[left_role][evidence_type] & evidence[right_role][evidence_type]
+            if overlap:
+                raise ValueError(f"{left_role} and {right_role} evalsets overlap in {evidence_type} evidence")
+
+
+def _is_windows_reserved_name(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    basename = value.rstrip(" .").split(".", 1)[0]
+    return basename.casefold() in WINDOWS_RESERVED_BASENAMES
+
 
 def _validate_safe_path_component(value: Any, *, label: str) -> str:
-    if not isinstance(value, str) or SAFE_PATH_COMPONENT.fullmatch(value) is None:
+    if not isinstance(value, str) or SAFE_PATH_COMPONENT.fullmatch(value) is None or _is_windows_reserved_name(value):
         raise ValueError(f"{label} must be a safe single path component")
     return value
 
@@ -1359,10 +1524,13 @@ def _index_gate_cases(
     indexed: dict[str, dict[str, Any]] = {}
     issues: list[str] = []
     for position, case in enumerate(cases):
-        if not isinstance(case, dict) or not str(case.get("case_id", "")).strip():
-            issues.append(f"case_results[{position}] has no case_id")
+        if not isinstance(case, dict):
+            issues.append(f"case_results[{position}] must be an object")
             continue
-        case_id = str(case["case_id"])
+        case_id = case.get("case_id")
+        if not isinstance(case_id, str) or not case_id.strip():
+            issues.append(f"case_results[{position}] case_id must be a non-empty string")
+            continue
         if case_id in indexed:
             issues.append(f"duplicate case_id: {case_id}")
             continue
@@ -1372,9 +1540,24 @@ def _index_gate_cases(
 
 def _normalized_gate_tags(case: dict[str, Any]) -> set[str]:
     tags = case.get("tags", [])
-    if not isinstance(tags, (list, tuple, set)):
+    if not isinstance(tags, list):
         return set()
     return {str(tag).lower() for tag in tags}
+
+
+def _normalize_required_metrics(value: Any, candidate_metrics: dict[str, Any]) -> tuple[list[str], str | None]:
+    if value == "all":
+        names = [name for name in candidate_metrics if isinstance(name, str) and name.strip()]
+        if not names or len(names) != len(candidate_metrics):
+            return [], "required_metrics='all' requires a non-empty object with string metric names"
+        return sorted(names), None
+    if not isinstance(value, list):
+        return [], "required_metrics must be 'all' or an array of non-empty unique strings"
+    if any(not isinstance(name, str) or not name.strip() for name in value):
+        return [], "required_metrics must contain only non-empty strings"
+    if len(set(value)) != len(value):
+        return [], "required_metrics must contain unique strings"
+    return value, None
 
 
 def apply_gate(
@@ -1393,15 +1576,27 @@ def apply_gate(
     reasons.extend(candidate_issues)
     accepted = not reasons
 
+    allow_new_hard_fails = gate_config.get("allow_new_hard_fails", False)
+    if not isinstance(allow_new_hard_fails, bool):
+        allow_new_hard_fails = False
+        accepted = False
+        reasons.append("allow_new_hard_fails must be a boolean and was treated as false")
+    allow_critical_regression = gate_config.get("allow_critical_regression", False)
+    if not isinstance(allow_critical_regression, bool):
+        allow_critical_regression = False
+        accepted = False
+        reasons.append("allow_critical_regression must be a boolean and was treated as false")
+
     for label, cases in (("baseline", baseline_by_id), ("candidate", candidate_by_id)):
         for case_id, case in cases.items():
-            if _finite_float(case.get("score")) is None:
+            score = _finite_float(case.get("score"))
+            if score is None or not 0 <= score <= 1:
                 accepted = False
-                reasons.append(f"{label} case {case_id} score must be a finite number")
+                reasons.append(f"{label} case {case_id} score must be a finite number in [0, 1]")
             if not isinstance(case.get("passed"), bool):
                 accepted = False
                 reasons.append(f"{label} case {case_id} passed must be a boolean")
-            if not isinstance(case.get("tags", []), (list, tuple, set)):
+            if not isinstance(case.get("tags", []), list):
                 accepted = False
                 reasons.append(f"{label} case {case_id} tags must be an array")
 
@@ -1413,6 +1608,12 @@ def apply_gate(
     validation_delta = (
         raw_validation_delta if raw_validation_delta is not None and math.isfinite(raw_validation_delta) else None
     )
+    if baseline_score is not None and not 0 <= baseline_score <= 1:
+        baseline_score = None
+    if candidate_score is not None and not 0 <= candidate_score <= 1:
+        candidate_score = None
+    if baseline_score is None or candidate_score is None:
+        validation_delta = None
     if validation_delta is None:
         accepted = False
         reasons.append("baseline and candidate validation scores must be finite numbers")
@@ -1454,7 +1655,7 @@ def apply_gate(
         for case_id in common_case_ids
         if baseline_by_id[case_id].get("passed") and not candidate_by_id[case_id].get("passed")
     ]
-    if new_hard_fail_ids and not gate_config.get("allow_new_hard_fails", False):
+    if new_hard_fail_ids and not allow_new_hard_fails:
         accepted = False
         reasons.append("candidate introduced hard fail(s): " + ", ".join(new_hard_fail_ids))
 
@@ -1466,20 +1667,22 @@ def apply_gate(
         and _finite_float(baseline_by_id[case_id].get("score")) is not None
         and _finite_float(candidate_by_id[case_id].get("score")) < _finite_float(baseline_by_id[case_id].get("score"))
     ]
-    if critical_regression_ids and not gate_config.get("allow_critical_regression", False):
+    if critical_regression_ids and not allow_critical_regression:
         accepted = False
         reasons.append("candidate regressed critical case(s): " + ", ".join(critical_regression_ids))
 
     normalized_cost = None if cost_usd is None else _finite_float(cost_usd)
-    if cost_usd is not None and normalized_cost is None:
+    if cost_usd is not None and (normalized_cost is None or normalized_cost < 0):
+        normalized_cost = None
         accepted = False
-        reasons.append("run cost must be a finite number")
+        reasons.append("run cost must be a finite non-negative number")
 
     max_cost = gate_config.get("max_cost_usd")
     normalized_max_cost = None if max_cost is None else _finite_float(max_cost)
-    if max_cost is not None and normalized_max_cost is None:
+    if max_cost is not None and (normalized_max_cost is None or normalized_max_cost < 0):
+        normalized_max_cost = None
         accepted = False
-        reasons.append("cost budget must be a finite number")
+        reasons.append("cost budget must be a finite non-negative number")
     elif max_cost is not None and cost_usd is None:
         accepted = False
         reasons.append("cost budget could not be evaluated because run cost is unknown")
@@ -1490,24 +1693,30 @@ def apply_gate(
     max_seconds = gate_config.get("max_duration_seconds")
     normalized_duration = _finite_float(duration_seconds)
     normalized_max_seconds = None if max_seconds is None else _finite_float(max_seconds)
-    if normalized_duration is None:
+    if normalized_duration is None or normalized_duration < 0:
+        normalized_duration = None
         accepted = False
-        reasons.append("run duration must be a finite number")
-    elif max_seconds is not None and normalized_max_seconds is None:
+        reasons.append("run duration must be a finite non-negative number")
+    elif max_seconds is not None and (normalized_max_seconds is None or normalized_max_seconds < 0):
+        normalized_max_seconds = None
         accepted = False
-        reasons.append("duration budget must be a finite number")
+        reasons.append("duration budget must be a finite non-negative number")
     elif max_seconds is not None and normalized_duration > normalized_max_seconds:
         accepted = False
         reasons.append(f"run exceeded duration budget: {normalized_duration:.2f}s > {normalized_max_seconds:.2f}s")
 
-    required = gate_config.get("required_metrics") or []
     candidate_metrics = candidate_val.get("metrics")
     if not isinstance(candidate_metrics, dict):
         candidate_metrics = {}
         accepted = False
         reasons.append("candidate metrics must be an object")
-    if required == "all":
-        required = sorted(candidate_metrics.keys())
+    required, required_issue = _normalize_required_metrics(
+        gate_config.get("required_metrics", []),
+        candidate_metrics,
+    )
+    if required_issue:
+        accepted = False
+        reasons.append(required_issue)
     missing_or_failed = []
     for name in required:
         metric = candidate_metrics.get(name)
@@ -1965,6 +2174,7 @@ async def build_offline_report(
             "optimizer": {
                 "estimated_cost": 0.0,
                 "model_calls": 0,
+                "candidate_evaluation_agent_calls": 0,
                 "reflection_lm_calls": 0,
                 "judge_model_calls": 0,
                 "token_usage": {
@@ -1974,6 +2184,17 @@ async def build_offline_report(
                 },
                 "token_usage_known": True,
                 "unknown_token_usage_reason": None,
+                "usage_evidence_valid": True,
+                "reflection_reported_usage": {
+                    "estimated_cost": 0.0,
+                    "token_usage": {
+                        "prompt": 0,
+                        "completion": 0,
+                        "total": 0,
+                    },
+                    "token_usage_known": True,
+                    "unknown_token_usage_reason": None,
+                },
             },
             "final_revalidation": {
                 "estimated_cost": 0.0,
@@ -2117,11 +2338,11 @@ def _optimizer_extra(result: Any) -> dict[str, Any]:
     }
 
 
-def _int_attr(obj: Any, name: str) -> int:
-    try:
-        return int(getattr(obj, name, 0) or 0)
-    except (TypeError, ValueError):
-        return 0
+def _count_attr(obj: Any, name: str) -> tuple[int, bool]:
+    value = getattr(obj, name, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0, True
+    return value, False
 
 
 def _is_llm_metric(metric: dict[str, Any]) -> bool:
@@ -2149,44 +2370,50 @@ def final_revalidation_call_audit(
 def online_cost_audit(
     result: Any,
     *,
+    optimizer_candidate_agent_calls: int,
     final_revalidation_calls: dict[str, int],
 ) -> dict[str, Any]:
-    reflection_calls = _int_attr(result, "total_reflection_lm_calls")
-    judge_calls = _int_attr(result, "total_judge_model_calls")
-    optimizer_calls = reflection_calls + judge_calls
+    reflection_calls, invalid_reflection_calls = _count_attr(result, "total_reflection_lm_calls")
+    judge_calls, invalid_judge_calls = _count_attr(result, "total_judge_model_calls")
+    candidate_calls, invalid_candidate_calls = _normalized_round_count(optimizer_candidate_agent_calls)
+    optimizer_calls = candidate_calls + reflection_calls + judge_calls
     token_usage, invalid_token_usage = _normalized_token_usage(getattr(result, "total_token_usage", {}))
     raw_cost = getattr(result, "total_llm_cost", None)
-    optimizer_cost: float | None = None
-    if raw_cost is not None:
-        try:
-            parsed_cost = float(raw_cost)
-            if (
-                math.isfinite(parsed_cost)
-                and parsed_cost >= 0
-                and (parsed_cost != 0.0 or (optimizer_calls == 0 and token_usage["total"] == 0))
-            ):
-                optimizer_cost = parsed_cost
-        except (TypeError, ValueError):
-            optimizer_cost = None
+    reflection_cost = _finite_float(raw_cost)
+    invalid_cost = reflection_cost is None or reflection_cost < 0
+    if invalid_cost:
+        reflection_cost = None
+
+    malformed_native_usage = (
+        invalid_reflection_calls
+        or invalid_judge_calls
+        or invalid_candidate_calls
+        or invalid_token_usage
+        or invalid_cost
+    )
+    phase_usage_known = not malformed_native_usage and candidate_calls == 0
+    optimizer_cost = reflection_cost if phase_usage_known else None
+    optimizer_token_usage = token_usage if phase_usage_known else None
 
     total_cost = optimizer_cost
     unknown_reasons: list[str] = []
-    if optimizer_cost is None and (optimizer_calls > 0 or token_usage["total"] > 0):
-        unknown_reasons.append("optimizer returned calls or tokens without a provider-priced cost")
-        total_cost = None
-    if invalid_token_usage:
-        unknown_reasons.append("optimizer token usage was malformed and normalized to zero")
+    if candidate_calls > 0:
+        unknown_reasons.append("optimizer candidate-evaluation calls do not expose token or cost usage")
+    if malformed_native_usage:
+        unknown_reasons.append("optimizer native usage counters were malformed and normalized fail-closed")
     if final_revalidation_calls["model_calls"] > 0:
         unknown_reasons.append("final revalidation model calls are not provider-priced by AgentEvaluator")
         total_cost = None
 
     final_tokens_known = final_revalidation_calls["model_calls"] == 0
     final_token_usage = {name: 0 for name in TOKEN_USAGE_KEYS} if final_tokens_known else None
-    pipeline_tokens_known = not invalid_token_usage and final_tokens_known
-    pipeline_token_usage = token_usage if pipeline_tokens_known else None
+    pipeline_tokens_known = phase_usage_known and final_tokens_known
+    pipeline_token_usage = optimizer_token_usage if pipeline_tokens_known else None
     token_unknown_reasons = []
-    if invalid_token_usage:
-        token_unknown_reasons.append("optimizer token usage was malformed")
+    if candidate_calls > 0:
+        token_unknown_reasons.append("optimizer candidate-evaluation token usage is not exposed")
+    if malformed_native_usage:
+        token_unknown_reasons.append("optimizer native usage counters were malformed")
     if not final_tokens_known:
         token_unknown_reasons.append("AgentEvaluator does not expose final revalidation token usage")
 
@@ -2202,11 +2429,21 @@ def online_cost_audit(
         "optimizer": {
             "estimated_cost": optimizer_cost,
             "model_calls": optimizer_calls,
+            "candidate_evaluation_agent_calls": candidate_calls,
             "reflection_lm_calls": reflection_calls,
             "judge_model_calls": judge_calls,
-            "token_usage": token_usage,
-            "token_usage_known": not invalid_token_usage,
-            "unknown_token_usage_reason": "malformed optimizer token usage" if invalid_token_usage else None,
+            "token_usage": optimizer_token_usage,
+            "token_usage_known": phase_usage_known,
+            "unknown_token_usage_reason": (None if phase_usage_known else "; ".join(token_unknown_reasons[:2])),
+            "usage_evidence_valid": not malformed_native_usage,
+            "reflection_reported_usage": {
+                "estimated_cost": reflection_cost,
+                "token_usage": token_usage,
+                "token_usage_known": not invalid_token_usage,
+                "unknown_token_usage_reason": (
+                    "malformed optimizer-reported reflection token usage" if invalid_token_usage else None
+                ),
+            },
         },
         "final_revalidation": {
             "estimated_cost": None,
@@ -2309,11 +2546,19 @@ async def run_online(
 
     online_dir = run_dir / "online"
     target = TargetPrompt().add_path("system_prompt", str(system_path)).add_path("router_prompt", str(router_path))
+    optimizer_candidate_agent_calls = 0
+    optimizer_call_agent = make_online_call_agent(system_prompt=system_path, router_prompt=router_path)
+
+    async def counted_optimizer_call_agent(query: str) -> str:
+        nonlocal optimizer_candidate_agent_calls
+        optimizer_candidate_agent_calls += 1
+        return await optimizer_call_agent(query)
+
     route_metric_state = _install_route_tool_args_metric()
     try:
         result = await AgentOptimizer.optimize(
             config_path=str(optimizer_path),
-            call_agent=make_online_call_agent(system_prompt=system_path, router_prompt=router_path),
+            call_agent=counted_optimizer_call_agent,
             target_prompt=target,
             train_dataset_path=str(train_path),
             validation_dataset_path=str(optimizer_dev_path),
@@ -2385,6 +2630,7 @@ async def run_online(
     metrics_config = load_json(metrics_path)
     cost = online_cost_audit(
         result,
+        optimizer_candidate_agent_calls=optimizer_candidate_agent_calls,
         final_revalidation_calls=final_revalidation_call_audit(
             [
                 baseline_train,
@@ -2454,9 +2700,9 @@ async def run_online(
         error_message = sanitize_report_text(getattr(result, "error_message", ""))
         if error_message:
             candidate["gate"]["reasons"].append(error_message)
-    if not cost["optimizer"]["token_usage_known"]:
+    if not cost["optimizer"]["usage_evidence_valid"]:
         candidate["gate"]["accepted"] = False
-        candidate["gate"]["reasons"].append("optimizer token usage was malformed and cannot be audited")
+        candidate["gate"]["reasons"].append("optimizer usage evidence was malformed and cannot be audited")
 
     artifacts = common_artifacts(
         run_dir=run_dir,

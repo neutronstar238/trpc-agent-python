@@ -59,12 +59,14 @@ generation instead of producing a partial artifact.
 In online mode, the duration gate uses elapsed pipeline time through
 optimization, baseline revalidation, and candidate revalidation. The separate
 `online_duration` fields retain those phase durations, while each candidate's
-audit retains its own revalidation duration. Token counters under `optimizer`
-cover only optimizer-reported reflection/judge usage. Final revalidation token
-usage is `null` with `token_usage_known=false` when `AgentEvaluator` cannot
-provide it, so optimizer-only counters are never presented as total pipeline
-token usage. `model_calls` remains the sum of optimizer and final revalidation
-call counts.
+audit retains its own revalidation duration. Optimizer `model_calls` includes
+candidate-evaluation agent calls, reflection calls, and judge calls. Because
+`AgentOptimizer` does not expose token or cost usage for candidate-evaluation
+calls, optimizer phase totals are `null` and marked unknown whenever those calls
+occur. `optimizer.reflection_reported_usage` preserves the native
+reflection-only cost and token counters under an explicit scope. Final
+revalidation token usage is likewise `null` when `AgentEvaluator` cannot expose
+it. Top-level `model_calls` is the optimizer phase plus final revalidation.
 
 A compact sample output is checked in at `fixtures/optimization_report.sample.json`.
 
@@ -87,6 +89,10 @@ and `--router-prompt` are used by online mode and are still recorded in offline
 configuration snapshots. Gate config may override validation delta, hard-fail,
 critical-regression, cost, duration, and required-metric checks. By default the
 gate inherits `optimize.stop.required_metrics` from `optimizer.json`.
+Gate booleans require JSON booleans, numeric thresholds require finite
+non-negative JSON numbers, and malformed values reject without raising. The
+three evalset roles must be different files with no byte-identical content and
+no overlap in case IDs, normalized user inputs, or exact gold outputs.
 
 The deterministic metric in this example is `route_tool_args_score`: it parses
 the final JSON response and scores only `route`, `tool.name`, and
@@ -100,6 +106,12 @@ not globally suppressed: an expected DeepSeek response-schema downgrade remains
 observable as a provider compatibility warning. SSE decoder shutdown or resource
 cleanup warnings are cleanup defects, not expected provider warnings, and should
 be investigated rather than filtered out.
+
+Report error text redacts provider URLs, configured provider credentials,
+standalone provider-key shapes, and semantic credential markers while retaining
+ordinary error context. Run IDs, candidate IDs, and optimizer prompt artifact
+names also reject or normalize Windows reserved device basenames on every
+platform.
 
 `optimizer_dev.evalset.json` is the optimizer-internal holdout passed to
 `AgentOptimizer.optimize(..., validation_dataset_path=...)`. `val.evalset.json`
