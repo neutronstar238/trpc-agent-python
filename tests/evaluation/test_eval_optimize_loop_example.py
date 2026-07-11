@@ -1274,6 +1274,42 @@ def test_validate_inputs_uses_json_criterion_numeric_tolerance(tmp_path: Path):
         module.validate_inputs(train, optimizer_dev, validation)
 
 
+def test_validate_inputs_uses_configured_json_criterion_tolerance(tmp_path: Path):
+    module = load_pipeline_module()
+    train, optimizer_dev, validation = _copy_public_evalsets(tmp_path)
+    train_payload = load_report(train)
+    dev_payload = load_report(optimizer_dev)
+    train_payload["eval_cases"][0]["conversation"][0]["final_response"]["parts"] = [{"text": '{"x":1.0}'}]
+    dev_payload["eval_cases"][0]["conversation"][0]["final_response"]["parts"] = [{"text": '{"x":1.05}'}]
+    train.write_text(json.dumps(train_payload), encoding="utf-8")
+    optimizer_dev.write_text(json.dumps(dev_payload), encoding="utf-8")
+    metrics_config = {
+        "metrics": [
+            {
+                "metric_name": "json_match",
+                "threshold": 1.0,
+                "criterion": {
+                    "final_response": {
+                        "json": {
+                            "match": "exact",
+                            "number_tolerance": 0.1,
+                        }
+                    }
+                },
+            }
+        ],
+        "num_runs": 1,
+    }
+
+    with pytest.raises(ValueError, match="gold"):
+        module.validate_inputs(
+            train,
+            optimizer_dev,
+            validation,
+            metrics_config=metrics_config,
+        )
+
+
 def test_directory_layout_and_assets_exist():
     expected = {
         "README.md",
@@ -1289,6 +1325,7 @@ def test_directory_layout_and_assets_exist():
         "agent/prompts/system.md",
         "agent/prompts/router.md",
         "fixtures/fake_outputs.json",
+        "fixtures/offline_metrics.sample.json",
         "fixtures/trace_outputs.json",
         "fixtures/optimization_report.sample.json",
     }
@@ -1724,7 +1761,7 @@ def test_report_semantics_recompute_critical_regression_gate_evidence():
     candidate["case_deltas"] = module.build_case_deltas(report["baseline"]["validation"], validation)
     report["delta"] = copy.deepcopy(candidate["delta"])
 
-    with pytest.raises(ValidationError, match="gate evidence|primary metric"):
+    with pytest.raises(ValidationError, match="gate evidence|primary metric|metric-derived score"):
         module.validate_report_schema(report)
 
 
@@ -1769,6 +1806,31 @@ def test_report_semantics_require_complete_consistent_case_metrics(mutation: str
         module.validate_report_schema(report)
 
 
+def test_report_semantics_recompute_case_score_when_primary_metric_is_null():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    candidate = next(item for item in report["candidates"] if item["gate"]["accepted"])
+    case = candidate["validation"]["case_results"][0]
+    primary = case["metrics"][ROUTE_TOOL_ARGS_METRIC]
+    primary.update({"score": None, "passed": False, "status": "failed"})
+    rubric = case["metrics"]["llm_rubric_response"]
+    rubric.update({"score": 0.5, "threshold": 0.66, "passed": False, "status": "failed"})
+    case.update(
+        {
+            "score": 1.0,
+            "passed": False,
+            "root_cause": "rubric_failed",
+            "reasons": ["rubric metric failed"],
+        }
+    )
+    candidate["validation"]["pass_rate"] = 0.666667
+    candidate["validation"]["failed_case_ids"] = [case["case_id"]]
+    candidate["final_validation"] = copy.deepcopy(candidate["validation"])
+
+    with pytest.raises(ValidationError, match="metric-derived score"):
+        module.validate_report_schema(report)
+
+
 def test_sample_report_records_hashed_normalized_evaluation_config():
     module = load_pipeline_module()
     report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
@@ -1779,6 +1841,21 @@ def test_sample_report_records_hashed_normalized_evaluation_config():
     snapshot["evaluation"]["num_runs"] = 2
     with pytest.raises(ValidationError, match="evaluation config hash"):
         module.validate_report_schema(report)
+    snapshot["evaluation_sha256"] = module.sha256_json(snapshot["evaluation"])
+    with pytest.raises(ValidationError, match="evaluation metrics artifact"):
+        module.validate_report_schema(report)
+
+
+def test_sample_prompt_artifact_hashes_are_self_contained():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    artifacts = list(report["baseline"]["prompt_artifacts"])
+    for candidate in report["candidates"]:
+        artifacts.extend(candidate["prompt_artifacts"])
+
+    assert artifacts
+    for artifact in artifacts:
+        assert artifact["sha256"] == module.sha256_text(artifact["content"])
 
 
 def test_report_semantics_reconcile_candidate_audit_cost_with_pipeline_cost():
@@ -1799,6 +1876,10 @@ def test_report_semantics_reconcile_candidate_audit_cost_with_pipeline_cost():
         "config_extra_secret",
         "duplicate_round",
         "round_prompt_hash_keys",
+        "candidate_prompt_hash",
+        "round_prompt_hash_value",
+        "missing_config_hash_disagreement",
+        "evalset_turn_count",
     ],
 )
 def test_report_semantics_bind_reproducibility_audit_fields(mutation: str):
@@ -1809,6 +1890,7 @@ def test_report_semantics_bind_reproducibility_audit_fields(mutation: str):
         "optimized_field_names": [],
         "prompt_paths": {"system_prompt": "runs/sample/system.md"},
         "prompt_sha256": {"system_prompt": "0" * 64},
+        "prompt_contents": {"system_prompt": "round content"},
         "validation_pass_rate": 0.0,
         "metric_breakdown": {},
         "accepted": False,
@@ -1828,9 +1910,23 @@ def test_report_semantics_bind_reproducibility_audit_fields(mutation: str):
         report["config_snapshot"]["api_key"] = "must-not-be-accepted"
     elif mutation == "duplicate_round":
         report["optimization_rounds"] = [copy.deepcopy(round_record), copy.deepcopy(round_record)]
-    else:
+    elif mutation == "round_prompt_hash_keys":
         round_record["prompt_sha256"] = {}
         report["optimization_rounds"] = [round_record]
+    elif mutation == "candidate_prompt_hash":
+        report["candidates"][0]["prompt_artifacts"][0]["sha256"] = "0" * 64
+    elif mutation == "round_prompt_hash_value":
+        round_record["prompt_paths"]["system_prompt"] = str(EXAMPLE_DIR / "agent" / "prompts" / "system.md")
+        report["optimization_rounds"] = [round_record]
+    elif mutation == "missing_config_hash_disagreement":
+        missing_path = "missing/optimizer.json"
+        report["config_snapshot"]["paths"]["optimizer_config"] = missing_path
+        report["environment_snapshot"]["config_path"] = missing_path
+        for index, candidate in enumerate(report["candidates"]):
+            candidate["audit"]["config_path"] = missing_path
+            candidate["audit"]["config_sha256"] = f"{index + 1:064x}"
+    else:
+        report["config_snapshot"]["evalsets"]["train"]["turn_count"] = 99
 
     with pytest.raises(ValidationError):
         module.validate_report_schema(report)

@@ -12,7 +12,8 @@
         "sha256": "ac2208517d00b42bccfc2336108753e0e3c0ea238345c6b851896b09a4819ab3",
         "source_written": false,
         "summary": "Baseline overuses FAQ and misses refund and account-escalation intent.",
-        "diff": "unchanged"
+        "diff": "unchanged",
+        "content": "You are a support-routing agent.\n\nReturn only one compact JSON object. Do not include markdown fences or extra text.\nThe JSON shape is:\n\n{\"route\":\"\",\"tool\":{\"name\":\"\",\"arguments\":{}},\"reason\":\"\"}\n\nKeep the reason short and do not promise refunds, credits, or manual handling\nunless the route rules require it.\n"
       },
       {
         "name": "router_prompt",
@@ -21,7 +22,8 @@
         "sha256": "1897b273cf69ace89b50e5c9ba77e135935544bd67100ecd11c78ee7fa317f10",
         "source_written": false,
         "summary": "Baseline overuses FAQ and misses refund and account-escalation intent.",
-        "diff": "unchanged"
+        "diff": "unchanged",
+        "content": "You route customer-support requests to one backend action.\n\nOutput exactly one JSON object with this shape:\n\n{\"route\":\"<refund|manual_escalation|faq>\",\"tool\":{\"name\":\"<tool name>\",\"arguments\":{}},\"reason\":\"<brief reason>\"}\n\nAllowed routes and tools:\n\n- refund -> create_refund_ticket\n- manual_escalation -> create_escalation_case\n- faq -> none\n\nRouting policy:\n\n1. Use refund when the user asks for refund handling for a broken, missing, or unusable delivered item.\n2. Use manual_escalation when the user explicitly requests a human agent for an account-access, safety, legal, or threat-of-reporting issue.\n3. Use faq for policy, shipping-status, coupon, address-change, and informational questions that do not require opening a backend case.\n4. When the request is ambiguous, choose faq and explain that it can be handled as a policy or information question.\n\nKeep tool.arguments as an empty object for this example. Do not include Markdown, comments, or extra keys.\n"
       }
     ],
     "train": {
@@ -585,7 +587,7 @@
           "known": true
         },
         "config_path": "examples/optimization/eval_optimize_loop/optimizer.json",
-        "config_sha256": "1e3c1759919721f9cc79702c9a933f9755f8d5cebff9efd6f03ee157d7a92528"
+        "config_sha256": "9df0a82039d6de55660169bf6061572da99b647f0141cdfcd5c6f0b4cd448d98"
       },
       "prompt_patch_summary": "Adds local routing rules for explicit refund requests and account-escalation demands while preserving FAQ for ordinary policy questions.",
       "prompt_artifacts": [
@@ -596,7 +598,8 @@
           "sha256": "ac2208517d00b42bccfc2336108753e0e3c0ea238345c6b851896b09a4819ab3",
           "source_written": false,
           "summary": "Adds local routing rules for explicit refund requests and account-escalation demands while preserving FAQ for ordinary policy questions.",
-          "diff": "unchanged"
+          "diff": "unchanged",
+          "content": "You are a support-routing agent.\n\nReturn only one compact JSON object. Do not include markdown fences or extra text.\nThe JSON shape is:\n\n{\"route\":\"\",\"tool\":{\"name\":\"\",\"arguments\":{}},\"reason\":\"\"}\n\nKeep the reason short and do not promise refunds, credits, or manual handling\nunless the route rules require it.\n"
         },
         {
           "name": "router_prompt",
@@ -605,7 +608,8 @@
           "sha256": "72579cd1131cd405b7458aef1bcd973f0d43e70c4ef6f82d1136bc7fb5ee9e67",
           "source_written": false,
           "summary": "Adds local routing rules for explicit refund requests and account-escalation demands while preserving FAQ for ordinary policy questions.",
-          "diff": "--- source/router_prompt.md\n+++ candidate/router_prompt.md\n@@ -18,3 +18,5 @@\n 4. When the request is ambiguous, choose faq and explain that it can be handled as a policy or information question.\n \n Keep tool.arguments as an empty object for this example. Do not include Markdown, comments, or extra keys.\n+\n+Offline candidate patch (candidate_local_patch): Adds local routing rules for explicit refund requests and account-escalation demands while preserving FAQ for ordinary policy questions.\n"
+          "diff": "--- source/router_prompt.md\n+++ candidate/router_prompt.md\n@@ -18,3 +18,5 @@\n 4. When the request is ambiguous, choose faq and explain that it can be handled as a policy or information question.\n \n Keep tool.arguments as an empty object for this example. Do not include Markdown, comments, or extra keys.\n+\n+Offline candidate patch (candidate_local_patch): Adds local routing rules for explicit refund requests and account-escalation demands while preserving FAQ for ordinary policy questions.\n",
+          "content": "You route customer-support requests to one backend action.\n\nOutput exactly one JSON object with this shape:\n\n{\"route\":\"<refund|manual_escalation|faq>\",\"tool\":{\"name\":\"<tool name>\",\"arguments\":{}},\"reason\":\"<brief reason>\"}\n\nAllowed routes and tools:\n\n- refund -> create_refund_ticket\n- manual_escalation -> create_escalation_case\n- faq -> none\n\nRouting policy:\n\n1. Use refund when the user asks for refund handling for a broken, missing, or unusable delivered item.\n2. Use manual_escalation when the user explicitly requests a human agent for an account-access, safety, legal, or threat-of-reporting issue.\n3. Use faq for policy, shipping-status, coupon, address-change, and informational questions that do not require opening a backend case.\n4. When the request is ambiguous, choose faq and explain that it can be handled as a policy or information question.\n\nKeep tool.arguments as an empty object for this example. Do not include Markdown, comments, or extra keys.\n\nOffline candidate patch (candidate_local_patch): Adds local routing rules for explicit refund requests and account-escalation demands while preserving FAQ for ordinary policy questions.\n"
         }
       ],
       "train": {
@@ -1222,7 +1226,7 @@
           "known": true
         },
         "config_path": "examples/optimization/eval_optimize_loop/optimizer.json",
-        "config_sha256": "1e3c1759919721f9cc79702c9a933f9755f8d5cebff9efd6f03ee157d7a92528"
+        "config_sha256": "9df0a82039d6de55660169bf6061572da99b647f0141cdfcd5c6f0b4cd448d98"
       },
       "prompt_patch_summary": "Rephrases baseline guidance without changing route decisions.",
       "prompt_artifacts": [
@@ -1233,7 +1237,8 @@
           "sha256": "ac2208517d00b42bccfc2336108753e0e3c0ea238345c6b851896b09a4819ab3",
           "source_written": false,
           "summary": "Rephrases baseline guidance without changing route decisions.",
-          "diff": "unchanged"
+          "diff": "unchanged",
+          "content": "You are a support-routing agent.\n\nReturn only one compact JSON object. Do not include markdown fences or extra text.\nThe JSON shape is:\n\n{\"route\":\"\",\"tool\":{\"name\":\"\",\"arguments\":{}},\"reason\":\"\"}\n\nKeep the reason short and do not promise refunds, credits, or manual handling\nunless the route rules require it.\n"
         },
         {
           "name": "router_prompt",
@@ -1242,7 +1247,8 @@
           "sha256": "8250ad478bed5bb80900204d05395f7110bcc5f46f62666c7d7a74c64ea0ccc1",
           "source_written": false,
           "summary": "Rephrases baseline guidance without changing route decisions.",
-          "diff": "--- source/router_prompt.md\n+++ candidate/router_prompt.md\n@@ -18,3 +18,5 @@\n 4. When the request is ambiguous, choose faq and explain that it can be handled as a policy or information question.\n \n Keep tool.arguments as an empty object for this example. Do not include Markdown, comments, or extra keys.\n+\n+Offline candidate patch (candidate_noop): Rephrases baseline guidance without changing route decisions.\n"
+          "diff": "--- source/router_prompt.md\n+++ candidate/router_prompt.md\n@@ -18,3 +18,5 @@\n 4. When the request is ambiguous, choose faq and explain that it can be handled as a policy or information question.\n \n Keep tool.arguments as an empty object for this example. Do not include Markdown, comments, or extra keys.\n+\n+Offline candidate patch (candidate_noop): Rephrases baseline guidance without changing route decisions.\n",
+          "content": "You route customer-support requests to one backend action.\n\nOutput exactly one JSON object with this shape:\n\n{\"route\":\"<refund|manual_escalation|faq>\",\"tool\":{\"name\":\"<tool name>\",\"arguments\":{}},\"reason\":\"<brief reason>\"}\n\nAllowed routes and tools:\n\n- refund -> create_refund_ticket\n- manual_escalation -> create_escalation_case\n- faq -> none\n\nRouting policy:\n\n1. Use refund when the user asks for refund handling for a broken, missing, or unusable delivered item.\n2. Use manual_escalation when the user explicitly requests a human agent for an account-access, safety, legal, or threat-of-reporting issue.\n3. Use faq for policy, shipping-status, coupon, address-change, and informational questions that do not require opening a backend case.\n4. When the request is ambiguous, choose faq and explain that it can be handled as a policy or information question.\n\nKeep tool.arguments as an empty object for this example. Do not include Markdown, comments, or extra keys.\n\nOffline candidate patch (candidate_noop): Rephrases baseline guidance without changing route decisions.\n"
         }
       ],
       "train": {
@@ -1893,7 +1899,7 @@
           "known": true
         },
         "config_path": "examples/optimization/eval_optimize_loop/optimizer.json",
-        "config_sha256": "1e3c1759919721f9cc79702c9a933f9755f8d5cebff9efd6f03ee157d7a92528"
+        "config_sha256": "9df0a82039d6de55660169bf6061572da99b647f0141cdfcd5c6f0b4cd448d98"
       },
       "prompt_patch_summary": "Overfits to emotional wording and sends angry logistics questions to manual escalation.",
       "prompt_artifacts": [
@@ -1904,7 +1910,8 @@
           "sha256": "ac2208517d00b42bccfc2336108753e0e3c0ea238345c6b851896b09a4819ab3",
           "source_written": false,
           "summary": "Overfits to emotional wording and sends angry logistics questions to manual escalation.",
-          "diff": "unchanged"
+          "diff": "unchanged",
+          "content": "You are a support-routing agent.\n\nReturn only one compact JSON object. Do not include markdown fences or extra text.\nThe JSON shape is:\n\n{\"route\":\"\",\"tool\":{\"name\":\"\",\"arguments\":{}},\"reason\":\"\"}\n\nKeep the reason short and do not promise refunds, credits, or manual handling\nunless the route rules require it.\n"
         },
         {
           "name": "router_prompt",
@@ -1913,7 +1920,8 @@
           "sha256": "efccbd30ad31da466bba7f40a9fd3293cc851f2a3b9908e41e5e9a28a54076b1",
           "source_written": false,
           "summary": "Overfits to emotional wording and sends angry logistics questions to manual escalation.",
-          "diff": "--- source/router_prompt.md\n+++ candidate/router_prompt.md\n@@ -18,3 +18,5 @@\n 4. When the request is ambiguous, choose faq and explain that it can be handled as a policy or information question.\n \n Keep tool.arguments as an empty object for this example. Do not include Markdown, comments, or extra keys.\n+\n+Offline candidate patch (candidate_overfit): Overfits to emotional wording and sends angry logistics questions to manual escalation.\n"
+          "diff": "--- source/router_prompt.md\n+++ candidate/router_prompt.md\n@@ -18,3 +18,5 @@\n 4. When the request is ambiguous, choose faq and explain that it can be handled as a policy or information question.\n \n Keep tool.arguments as an empty object for this example. Do not include Markdown, comments, or extra keys.\n+\n+Offline candidate patch (candidate_overfit): Overfits to emotional wording and sends angry logistics questions to manual escalation.\n",
+          "content": "You route customer-support requests to one backend action.\n\nOutput exactly one JSON object with this shape:\n\n{\"route\":\"<refund|manual_escalation|faq>\",\"tool\":{\"name\":\"<tool name>\",\"arguments\":{}},\"reason\":\"<brief reason>\"}\n\nAllowed routes and tools:\n\n- refund -> create_refund_ticket\n- manual_escalation -> create_escalation_case\n- faq -> none\n\nRouting policy:\n\n1. Use refund when the user asks for refund handling for a broken, missing, or unusable delivered item.\n2. Use manual_escalation when the user explicitly requests a human agent for an account-access, safety, legal, or threat-of-reporting issue.\n3. Use faq for policy, shipping-status, coupon, address-change, and informational questions that do not require opening a backend case.\n4. When the request is ambiguous, choose faq and explain that it can be handled as a policy or information question.\n\nKeep tool.arguments as an empty object for this example. Do not include Markdown, comments, or extra keys.\n\nOffline candidate patch (candidate_overfit): Overfits to emotional wording and sends angry logistics questions to manual escalation.\n"
         }
       ],
       "train": {
@@ -2702,12 +2710,35 @@
       "num_runs": 1
     },
     "evaluation_sha256": "a2a1ec7e174d243b397ee7875d7528cb198d1c1d3fbce9dc82f8cb85e33fe166",
+    "evaluation_metrics_sha256": "a2a1ec7e174d243b397ee7875d7528cb198d1c1d3fbce9dc82f8cb85e33fe166",
+    "optimizer_config_sha256": "9df0a82039d6de55660169bf6061572da99b647f0141cdfcd5c6f0b4cd448d98",
+    "evalsets": {
+      "train": {
+        "path": "examples/optimization/eval_optimize_loop/train.evalset.json",
+        "sha256": "a4f49908563bbea0ee1347428ee23f90c21c1fcebeda32d2905d44d8b14cf28f",
+        "case_count": 3,
+        "turn_count": 3
+      },
+      "optimizer_dev": {
+        "path": "examples/optimization/eval_optimize_loop/optimizer_dev.evalset.json",
+        "sha256": "7ee6e4824d41b4a2ce6e2ba75352dd1b3ccfecdd52a96620f458f95f810ce4fa",
+        "case_count": 3,
+        "turn_count": 3
+      },
+      "final_validation": {
+        "path": "examples/optimization/eval_optimize_loop/val.evalset.json",
+        "sha256": "d8c2cc40d15f4dc8f1d06982553a473dbca3fe20d3e38a9bce56fafcea119238",
+        "case_count": 3,
+        "turn_count": 3
+      }
+    },
     "paths": {
       "train_evalset": "examples/optimization/eval_optimize_loop/train.evalset.json",
       "optimizer_dev_evalset": "examples/optimization/eval_optimize_loop/optimizer_dev.evalset.json",
       "validation_evalset": "examples/optimization/eval_optimize_loop/val.evalset.json",
       "final_validation_evalset": "examples/optimization/eval_optimize_loop/val.evalset.json",
       "optimizer_config": "examples/optimization/eval_optimize_loop/optimizer.json",
+      "evaluation_metrics": "examples/optimization/eval_optimize_loop/fixtures/offline_metrics.sample.json",
       "fixture_outputs": "examples/optimization/eval_optimize_loop/fixtures/fake_outputs.json",
       "system_prompt": "examples/optimization/eval_optimize_loop/agent/prompts/system.md",
       "router_prompt": "examples/optimization/eval_optimize_loop/agent/prompts/router.md"
@@ -2733,7 +2764,7 @@
     "final_validation_evalset": "examples/optimization/eval_optimize_loop/val.evalset.json",
     "optimizer_config": "examples/optimization/eval_optimize_loop/optimizer.json",
     "fixtures": "examples/optimization/eval_optimize_loop/fixtures/fake_outputs.json",
-    "eval_metrics": "runs/sample/offline_metrics.json",
+    "eval_metrics": "examples/optimization/eval_optimize_loop/fixtures/offline_metrics.sample.json",
     "system_prompt": "examples/optimization/eval_optimize_loop/agent/prompts/system.md",
     "router_prompt": "examples/optimization/eval_optimize_loop/agent/prompts/router.md",
     "baseline_train_trace_evalset": "",

@@ -197,9 +197,23 @@ def validate_report_schema(report: dict[str, Any]) -> None:
             if case["passed"] and any(metric["passed"] is not True for metric in case_metrics.values()):
                 reject(f"{label} passed case contains failed metric evidence")
             primary_metric = case_metrics.get(PRIMARY_METRIC)
-            if isinstance(primary_metric, Mapping) and _finite_float(primary_metric.get("score")) is not None:
-                if round(case["score"], 6) != round(float(primary_metric["score"]), 6):
-                    reject(f"{label} case score does not match the primary metric")
+            primary_score = _finite_float(primary_metric.get("score")) if isinstance(primary_metric, Mapping) else None
+            if primary_score is not None:
+                expected_case_score = round(primary_score, 6)
+            else:
+                fallback_scores = [
+                    metric_score
+                    for metric in case_metrics.values()
+                    for metric_score in [_finite_float(metric.get("score"))]
+                    if metric_score is not None
+                ]
+                expected_case_score = (
+                    round(sum(fallback_scores) / len(fallback_scores), 6)
+                    if fallback_scores
+                    else (1.0 if case["passed"] else 0.0)
+                )
+            if round(case["score"], 6) != expected_case_score:
+                reject(f"{label} case score does not match metric-derived score")
         if set(summary["metrics"]) != numeric_case_metric_names:
             reject(f"{label} metric coverage does not match numeric case metric evidence")
         for metric_name, metric in summary["metrics"].items():
@@ -248,9 +262,33 @@ def validate_report_schema(report: dict[str, Any]) -> None:
         if duplicates:
             reject(f"{label} contains duplicate case_id values: {', '.join(duplicates)}")
 
+    def validate_prompt_artifacts(artifacts: list[dict[str, Any]], label: str) -> None:
+        names = [artifact["name"] for artifact in artifacts]
+        if len(names) != len(set(names)):
+            reject(f"{label} prompt artifact names must be unique")
+        for artifact in artifacts:
+            content = artifact["content"]
+            if artifact["sha256"] != sha256_text(content):
+                reject(f"{label} prompt artifact hash does not match embedded content")
+            if artifact["source_written"]:
+                reject(f"{label} prompt audit must not claim source writes")
+            candidate_path = Path(artifact["candidate_path"])
+            if not candidate_path.is_absolute():
+                candidate_path = REPO_ROOT / candidate_path
+            if candidate_path.is_file() and candidate_path.read_text(encoding="utf-8") != content:
+                reject(f"{label} prompt artifact content does not match the referenced file")
+            source_path = Path(artifact["source_path"])
+            if not source_path.is_absolute():
+                source_path = REPO_ROOT / source_path
+            if source_path.is_file():
+                source_text = source_path.read_text(encoding="utf-8")
+                if artifact["diff"] != prompt_diff(source_text, content, artifact["name"]):
+                    reject(f"{label} prompt artifact diff does not match source and candidate content")
+
     for summary_name in ("train", "optimizer_dev", "validation", "final_validation"):
         reject_duplicate_cases(baseline[summary_name], f"baseline.{summary_name}")
         validate_evaluation_summary(baseline[summary_name], f"baseline.{summary_name}")
+    validate_prompt_artifacts(baseline["prompt_artifacts"], "baseline")
 
     if report["failure_attribution"] != attribution_for(baseline["validation"]):
         reject("top-level failure attribution does not match baseline validation failures")
@@ -273,6 +311,55 @@ def validate_report_schema(report: dict[str, Any]) -> None:
     expected_judge_multiplier = judge_calls_per_agent_call(evaluation_snapshot)
     config_paths = config_snapshot["paths"]
     expected_optimizer_config_path = config_paths["optimizer_config"]
+    if report["artifacts"].get("optimizer_config") != expected_optimizer_config_path:
+        reject("optimizer config path does not match report artifacts")
+    expected_optimizer_config_hash = config_snapshot["optimizer_config_sha256"]
+    optimizer_config_artifact = Path(expected_optimizer_config_path)
+    if not optimizer_config_artifact.is_absolute():
+        optimizer_config_artifact = REPO_ROOT / optimizer_config_artifact
+    if (
+        optimizer_config_artifact.is_file()
+        and sha256_json_file(optimizer_config_artifact) != expected_optimizer_config_hash
+    ):
+        reject("optimizer config hash does not match the referenced config artifact")
+    if report["mode"] == "online" and optimizer_config_artifact.is_file():
+        runtime_evaluation = normalized_evaluation_config(
+            validated_optimizer_evaluate_config(optimizer_config_artifact)
+        )
+        if runtime_evaluation != evaluation_snapshot:
+            reject("evaluation snapshot does not match the runtime optimizer config")
+    evaluation_metrics_path = Path(config_paths["evaluation_metrics"])
+    if report["artifacts"].get("eval_metrics") != config_paths["evaluation_metrics"]:
+        reject("evaluation metrics path does not match report artifacts")
+    if not evaluation_metrics_path.is_absolute():
+        evaluation_metrics_path = REPO_ROOT / evaluation_metrics_path
+    if evaluation_metrics_path.is_file():
+        if sha256_json_file(evaluation_metrics_path) != config_snapshot["evaluation_metrics_sha256"]:
+            reject("evaluation metrics hash does not match the referenced artifact")
+        if normalized_evaluation_config(load_json(evaluation_metrics_path)) != evaluation_snapshot:
+            reject("evaluation snapshot does not match the evaluation metrics artifact")
+
+    manifest_path_keys = {
+        "train": "train_evalset",
+        "optimizer_dev": "optimizer_dev_evalset",
+        "final_validation": "final_validation_evalset",
+    }
+    evalset_manifests = config_snapshot["evalsets"]
+    for role, path_key in manifest_path_keys.items():
+        manifest = evalset_manifests[role]
+        if manifest["path"] != config_paths[path_key]:
+            reject(f"{role} evalset manifest path does not match config paths")
+        artifact_key = path_key
+        if report["artifacts"].get(artifact_key) != manifest["path"]:
+            reject(f"{role} evalset manifest path does not match report artifacts")
+        evalset_path = Path(manifest["path"])
+        if not evalset_path.is_absolute():
+            evalset_path = REPO_ROOT / evalset_path
+        if evalset_path.is_file():
+            observed_manifest = build_evalset_manifest(evalset_path)
+            for evidence_key in ("sha256", "case_count", "turn_count"):
+                if manifest[evidence_key] != observed_manifest[evidence_key]:
+                    reject(f"{role} evalset manifest {evidence_key} does not match the referenced artifact")
     environment = report["environment_snapshot"]
     if environment["seed"] != report["seed"]:
         reject("environment snapshot seed must match the report")
@@ -283,8 +370,18 @@ def validate_report_schema(report: dict[str, Any]) -> None:
     if len(round_ids) != len(set(round_ids)):
         reject("optimization round identifiers must be unique")
     for round_record in report["optimization_rounds"]:
-        if set(round_record["prompt_paths"]) != set(round_record["prompt_sha256"]):
-            reject("optimization round prompt path and hash keys must match")
+        prompt_keys = set(round_record["prompt_paths"])
+        if prompt_keys != set(round_record["prompt_sha256"]) or prompt_keys != set(round_record["prompt_contents"]):
+            reject("optimization round prompt path, hash, and content keys must match")
+        for name in prompt_keys:
+            content = round_record["prompt_contents"][name]
+            if round_record["prompt_sha256"][name] != sha256_text(content):
+                reject("optimization round prompt hash does not match embedded content")
+            prompt_path = Path(round_record["prompt_paths"][name])
+            if not prompt_path.is_absolute():
+                prompt_path = REPO_ROOT / prompt_path
+            if prompt_path.is_file() and prompt_path.read_text(encoding="utf-8") != content:
+                reject("optimization round prompt content does not match the referenced file")
     cost = report["cost"]
     if report["mode"] == "online":
         online_duration = report.get("online_duration")
@@ -351,16 +448,9 @@ def validate_report_schema(report: dict[str, Any]) -> None:
             reject(f"candidate audit seed does not match report seed: {candidate_id}")
         if candidate_audit["config_path"] != expected_optimizer_config_path:
             reject(f"candidate audit config path does not match config snapshot: {candidate_id}")
-        audit_config_path = Path(candidate_audit["config_path"])
-        if not audit_config_path.is_absolute():
-            audit_config_path = REPO_ROOT / audit_config_path
-        if audit_config_path.is_file() and candidate_audit["config_sha256"] != sha256_file(audit_config_path):
-            reject(f"candidate audit config hash does not match config artifact: {candidate_id}")
-        prompt_artifact_names = [artifact["name"] for artifact in candidate["prompt_artifacts"]]
-        if len(prompt_artifact_names) != len(set(prompt_artifact_names)):
-            reject(f"candidate prompt artifact names must be unique: {candidate_id}")
-        if any(artifact["source_written"] for artifact in candidate["prompt_artifacts"]):
-            reject(f"candidate prompt audit must not claim source writes: {candidate_id}")
+        if candidate_audit["config_sha256"] != expected_optimizer_config_hash:
+            reject(f"candidate audit config hash does not match config snapshot: {candidate_id}")
+        validate_prompt_artifacts(candidate["prompt_artifacts"], f"candidate {candidate_id}")
         pipeline_cost = cost["estimated_total"]
         audit_cost = candidate_audit["cost"]
         if audit_cost["known"] is not (pipeline_cost is not None) or audit_cost["estimated"] != pipeline_cost:
@@ -483,6 +573,12 @@ def validate_report_schema(report: dict[str, Any]) -> None:
     )
     if optimizer_cost["model_calls"] != expected_optimizer_calls:
         reject("optimizer model_calls must equal candidate, reflection, and judge calls")
+    if report["mode"] == "online":
+        expected_agent_calls_per_run = (1 + len(report["candidates"])) * sum(
+            manifest["turn_count"] for manifest in evalset_manifests.values()
+        )
+        if final_cost["agent_calls_per_run"] != expected_agent_calls_per_run:
+            reject("final revalidation per-run calls do not match authenticated evalset turns")
     expected_final_agent_calls = final_cost["agent_calls_per_run"] * evaluation_snapshot["num_runs"]
     if final_cost["agent_calls"] != expected_final_agent_calls:
         reject("final revalidation agent calls do not match per-run calls and evaluation num_runs")
@@ -613,6 +709,10 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def sha256_json_file(path: Path) -> str:
+    return sha256_json(load_json(path))
+
+
 def _redact_evaluation_config(value: Any) -> Any:
     if isinstance(value, dict):
         redacted: dict[str, Any] = {}
@@ -664,6 +764,37 @@ def normalized_evaluation_config(metrics_config: Mapping[str, Any]) -> dict[str,
     return snapshot
 
 
+def build_evalset_manifest(path: Path) -> dict[str, Any]:
+    payload = load_json(path)
+    cases = payload.get("eval_cases") if isinstance(payload, dict) else None
+    if not isinstance(cases, list) or not cases:
+        raise ValueError(f"evalset manifest requires non-empty eval_cases: {path}")
+    turn_count = 0
+    for case in cases:
+        conversation = case.get("conversation") if isinstance(case, dict) else None
+        if not isinstance(conversation, list) or not conversation:
+            raise ValueError(f"evalset manifest requires non-empty conversations: {path}")
+        turn_count += len(conversation)
+    return {
+        "path": str(path),
+        "sha256": sha256_json_file(path),
+        "case_count": len(cases),
+        "turn_count": turn_count,
+    }
+
+
+def build_evalset_manifests(
+    train_evalset: Path,
+    optimizer_dev_evalset: Path,
+    val_evalset: Path,
+) -> dict[str, dict[str, Any]]:
+    return {
+        "train": build_evalset_manifest(train_evalset),
+        "optimizer_dev": build_evalset_manifest(optimizer_dev_evalset),
+        "final_validation": build_evalset_manifest(val_evalset),
+    }
+
+
 def build_candidate_audit(
     *,
     seed: int,
@@ -680,7 +811,7 @@ def build_candidate_audit(
             "known": cost_usd is not None,
         },
         "config_path": str(optimizer_config),
-        "config_sha256": sha256_file(optimizer_config),
+        "config_sha256": sha256_json_file(optimizer_config),
     }
 
 
@@ -808,6 +939,7 @@ def write_optimizer_round_artifacts(
         round_dir.mkdir(parents=True, exist_ok=True)
         prompt_paths: dict[str, str] = {}
         prompt_hashes: dict[str, str] = {}
+        prompt_contents: dict[str, str] = {}
         prompt_reasons: list[str] = []
         raw_candidate_prompts = getattr(round_record, "candidate_prompts", None)
         invalid_prompt_evidence = not isinstance(raw_candidate_prompts, dict)
@@ -851,6 +983,7 @@ def write_optimizer_round_artifacts(
             prompt_path.write_text(content, encoding="utf-8")
             prompt_paths[name] = str(prompt_path)
             prompt_hashes[name] = sha256_text(content)
+            prompt_contents[name] = content
         validation_pass_rate, invalid_validation_pass_rate = _normalized_round_number(
             getattr(round_record, "validation_pass_rate", None),
             nonnegative=True,
@@ -943,6 +1076,7 @@ def write_optimizer_round_artifacts(
                 "optimized_field_names": optimized_field_names,
                 "prompt_paths": prompt_paths,
                 "prompt_sha256": prompt_hashes,
+                "prompt_contents": prompt_contents,
                 "validation_pass_rate": float(validation_pass_rate),
                 "metric_breakdown": metric_breakdown,
                 "accepted": accepted,
@@ -1249,7 +1383,37 @@ def load_gate_config(
     return config
 
 
-def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalset: Path) -> None:
+def json_criteria_from_evaluation_config(metrics_config: Mapping[str, Any] | None) -> list[Any]:
+    from trpc_agent_sdk.evaluation._eval_config import EvalConfig
+    from trpc_agent_sdk.evaluation._eval_criterion import JSONCriterion
+
+    criteria: list[JSONCriterion] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, nested in value.items():
+                if str(key).lower() == "json" and isinstance(nested, Mapping):
+                    criteria.append(JSONCriterion.model_validate(dict(nested)))
+                else:
+                    collect(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect(nested)
+
+    if metrics_config is not None:
+        eval_config = EvalConfig.model_validate(dict(metrics_config))
+        for metric in eval_config.get_eval_metrics():
+            collect(metric.criterion)
+    return criteria or [JSONCriterion()]
+
+
+def validate_inputs(
+    train_evalset: Path,
+    optimizer_dev_evalset: Path,
+    val_evalset: Path,
+    *,
+    metrics_config: Mapping[str, Any] | None = None,
+) -> None:
     paths = {
         "train": train_evalset,
         "optimizer_dev": optimizer_dev_evalset,
@@ -1260,6 +1424,7 @@ def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalse
             raise FileNotFoundError(path)
 
     role_pairs = (("train", "optimizer_dev"), ("train", "final_validation"), ("optimizer_dev", "final_validation"))
+    json_criteria = json_criteria_from_evaluation_config(metrics_config)
     for left_role, right_role in role_pairs:
         left = paths[left_role]
         right = paths[right_role]
@@ -1330,11 +1495,9 @@ def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalse
             overlap = evidence[left_role][evidence_type] & evidence[right_role][evidence_type]
             if overlap:
                 raise ValueError(f"{left_role} and {right_role} evalsets overlap in {evidence_type} evidence")
-        from trpc_agent_sdk.evaluation._eval_criterion import JSONCriterion
-
-        json_criterion = JSONCriterion()
         if any(
-            json_criterion.matches(left_gold, right_gold)
+            criterion.matches(left_gold, right_gold)
+            for criterion in json_criteria
             for left_gold in evidence[left_role]["json_gold"]
             for right_gold in evidence[right_role]["json_gold"]
         ):
@@ -1480,6 +1643,7 @@ def write_prompt_artifacts(
                 "source_path": str(source_path),
                 "candidate_path": str(candidate_path),
                 "sha256": sha256_text(candidate_text),
+                "content": candidate_text,
                 "source_written": source_written,
                 "summary": summary,
                 "diff": diff_text,
@@ -2933,12 +3097,16 @@ async def build_offline_report(
             "gate": gate_config,
             "evaluation": evaluation_snapshot,
             "evaluation_sha256": sha256_json(evaluation_snapshot),
+            "evaluation_metrics_sha256": sha256_json_file(metrics_path),
+            "optimizer_config_sha256": sha256_json_file(optimizer_config),
+            "evalsets": build_evalset_manifests(train_evalset, optimizer_dev_evalset, val_evalset),
             "paths": {
                 "train_evalset": str(train_evalset),
                 "optimizer_dev_evalset": str(optimizer_dev_evalset),
                 "validation_evalset": str(val_evalset),
                 "final_validation_evalset": str(val_evalset),
                 "optimizer_config": str(optimizer_config),
+                "evaluation_metrics": str(metrics_path),
                 "fixture_outputs": str(fixture_path),
                 "system_prompt": str(system_prompt),
                 "router_prompt": str(router_prompt),
@@ -3278,7 +3446,13 @@ async def run_fake_or_trace(
     fixture_path = resolve_path(fixture_outputs, fixture_default)
     system_path = resolve_path(system_prompt, SYSTEM_PROMPT_PATH)
     router_path = resolve_path(router_prompt, ROUTER_PROMPT_PATH)
-    validate_inputs(train_path, optimizer_dev_path, val_path)
+    optimizer_evaluate_config = validated_optimizer_evaluate_config(optimizer_path)
+    validate_inputs(
+        train_path,
+        optimizer_dev_path,
+        val_path,
+        metrics_config=optimizer_evaluate_config,
+    )
     gate = load_gate_config(gate_config_path, gate_config, optimizer_config=optimizer_path)
 
     report = await build_offline_report(
@@ -3333,7 +3507,13 @@ async def run_online(
     optimizer_path = resolve_path(optimizer_config, OPTIMIZER_CONFIG_PATH)
     system_path = resolve_path(system_prompt, SYSTEM_PROMPT_PATH)
     router_path = resolve_path(router_prompt, ROUTER_PROMPT_PATH)
-    validate_inputs(train_path, optimizer_dev_path, val_path)
+    source_evaluate_config = validated_optimizer_evaluate_config(optimizer_path)
+    validate_inputs(
+        train_path,
+        optimizer_dev_path,
+        val_path,
+        metrics_config=source_evaluate_config,
+    )
     runtime_optimizer_path = materialize_optimizer_config(
         run_dir=run_dir,
         source_config=optimizer_path,
@@ -3563,6 +3743,9 @@ async def run_online(
             "gate": gate,
             "evaluation": evaluation_snapshot,
             "evaluation_sha256": sha256_json(evaluation_snapshot),
+            "evaluation_metrics_sha256": sha256_json_file(metrics_path),
+            "optimizer_config_sha256": sha256_json_file(runtime_optimizer_path),
+            "evalsets": build_evalset_manifests(train_path, optimizer_dev_path, val_path),
             "paths": {
                 "train_evalset": str(train_path),
                 "optimizer_dev_evalset": str(optimizer_dev_path),
@@ -3570,6 +3753,7 @@ async def run_online(
                 "final_validation_evalset": str(val_path),
                 "optimizer_config": str(runtime_optimizer_path),
                 "optimizer_source_config": str(optimizer_path),
+                "evaluation_metrics": str(metrics_path),
                 "online_eval_metrics": str(metrics_path),
                 "system_prompt": str(system_path),
                 "router_prompt": str(router_path),

@@ -161,6 +161,7 @@
         "source_path",
         "candidate_path",
         "sha256",
+        "content",
         "source_written",
         "summary",
         "diff"
@@ -170,6 +171,7 @@
         "source_path": {"type": "string", "minLength": 1},
         "candidate_path": {"type": "string", "minLength": 1},
         "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "content": {"type": "string"},
         "source_written": {"type": "boolean"},
         "summary": {"type": "string"},
         "diff": {"type": "string"}
@@ -614,6 +616,7 @@
         "optimized_field_names",
         "prompt_paths",
         "prompt_sha256",
+        "prompt_contents",
         "validation_pass_rate",
         "metric_breakdown",
         "accepted",
@@ -633,6 +636,10 @@
         "prompt_sha256": {
           "type": "object",
           "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+        },
+        "prompt_contents": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
         },
         "validation_pass_rate": {"type": "number", "minimum": 0, "maximum": 1},
         "metric_breakdown": {"type": "object", "additionalProperties": {"type": "number"}},
@@ -751,6 +758,9 @@
         "gate",
         "evaluation",
         "evaluation_sha256",
+        "evaluation_metrics_sha256",
+        "optimizer_config_sha256",
+        "evalsets",
         "paths"
       ],
       "properties": {
@@ -759,6 +769,18 @@
         "gate": {"type": "object"},
         "evaluation": {"type": "object"},
         "evaluation_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "evaluation_metrics_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "optimizer_config_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "evalsets": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["train", "optimizer_dev", "final_validation"],
+          "properties": {
+            "train": {"$ref": "#/$defs/evalsetManifest"},
+            "optimizer_dev": {"$ref": "#/$defs/evalsetManifest"},
+            "final_validation": {"$ref": "#/$defs/evalsetManifest"}
+          }
+        },
         "paths": {
           "type": "object",
           "additionalProperties": false,
@@ -768,6 +790,7 @@
             "validation_evalset",
             "final_validation_evalset",
             "optimizer_config",
+            "evaluation_metrics",
             "system_prompt",
             "router_prompt"
           ],
@@ -777,6 +800,7 @@
             "validation_evalset": {"type": "string", "minLength": 1},
             "final_validation_evalset": {"type": "string", "minLength": 1},
             "optimizer_config": {"type": "string", "minLength": 1},
+            "evaluation_metrics": {"type": "string", "minLength": 1},
             "optimizer_source_config": {"type": "string", "minLength": 1},
             "fixture_outputs": {"type": "string", "minLength": 1},
             "online_eval_metrics": {"type": "string", "minLength": 1},
@@ -784,6 +808,17 @@
             "router_prompt": {"type": "string", "minLength": 1}
           }
         }
+      }
+    },
+    "evalsetManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "case_count", "turn_count"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "case_count": {"type": "integer", "minimum": 1},
+        "turn_count": {"type": "integer", "minimum": 1}
       }
     },
     "environmentSnapshot": {

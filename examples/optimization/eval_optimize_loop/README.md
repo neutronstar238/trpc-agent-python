@@ -66,8 +66,7 @@ judge model sample. `judge_calls_per_candidate_evaluation` records that
 multiplier; a nonzero native counter is reconciled with the derived count
 without double counting, and `judge_model_call_source` records the source.
 Final revalidation records the corresponding `judge_calls_per_agent_call` and
-counts every conversation turn, not only top-level cases.
-Because
+counts every conversation turn, not only top-level cases. Because
 `AgentOptimizer` does not expose token or cost usage for candidate-evaluation
 or judge calls, optimizer phase totals are `null` and marked unknown whenever
 those calls occur. `optimizer.reflection_reported_usage` preserves the native
@@ -133,7 +132,11 @@ seed from `--seed`, and passes that file to `AgentOptimizer`. Candidate and
 environment audits reference the same path and SHA-256. `config_snapshot` also
 stores a normalized, credential-free evaluation configuration and its hash;
 report validation derives optimizer and final judge-call multipliers from that
-snapshot rather than trusting the reported counters.
+snapshot rather than trusting the reported counters. Evaluation-metric and
+evalset manifests bind that snapshot to file hashes, case counts, and
+conversation-turn counts. Prompt artifacts and optimizer rounds embed prompt
+content so every reported SHA-256 remains independently recomputable even when
+the original run directory is unavailable.
 
 `optimizer_dev.evalset.json` is the optimizer-internal holdout passed to
 `AgentOptimizer.optimize(..., validation_dataset_path=...)`. `val.evalset.json`
