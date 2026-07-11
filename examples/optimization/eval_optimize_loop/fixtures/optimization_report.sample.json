@@ -2615,6 +2615,7 @@
       "model_calls": 0,
       "candidate_evaluation_agent_calls": 0,
       "reflection_lm_calls": 0,
+      "judge_calls_per_candidate_evaluation": 0,
       "judge_model_calls": 0,
       "native_judge_model_calls": 0,
       "derived_judge_model_calls": 0,
@@ -2641,6 +2642,7 @@
     "final_revalidation": {
       "estimated_cost": 0.0,
       "agent_calls": 0,
+      "judge_calls_per_agent_call": 0,
       "judge_model_calls": 0,
       "model_calls": 0,
       "token_usage": {

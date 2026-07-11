@@ -64,7 +64,14 @@ def _complete_summary(score: float, *, passed: bool, tags: list[str] | None = No
                 "user": "stubbed user",
                 "score": score,
                 "passed": passed,
-                "metrics": {},
+                "metrics": {
+                    ROUTE_TOOL_ARGS_METRIC: {
+                        "score": score,
+                        "threshold": 1.0,
+                        "passed": passed,
+                        "status": "passed" if passed else "failed",
+                    }
+                },
                 "actual_text": "",
                 "expected_text": "",
                 "key_trace": {
@@ -421,6 +428,42 @@ def test_load_gate_config_preserves_invalid_single_metric_string_for_rejection()
     )
     assert result["accepted"] is False
     assert "required_metrics" in " ".join(result["reasons"])
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        [["allow_new_hard_fails", True], ["required_metrics", []]],
+    ],
+)
+def test_load_gate_config_rejects_non_mapping_sources(tmp_path: Path, payload: Any):
+    module = load_pipeline_module()
+    gate_path = tmp_path / "gate.json"
+    gate_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="gate config.*object"):
+        module.load_gate_config(gate_path)
+    with pytest.raises(ValueError, match="gate config overrides.*mapping"):
+        module.load_gate_config(overrides=payload)
+
+
+def test_apply_gate_rejects_summary_score_not_derived_from_cases():
+    module = load_pipeline_module()
+    baseline_cases = [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}]
+    candidate_cases = [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}]
+
+    result = module.apply_gate(
+        candidate_id="forged_aggregate",
+        baseline_val=_gate_summary(0.25, baseline_cases),
+        candidate_val=_gate_summary(0.75, candidate_cases),
+        gate_config={"required_metrics": [ROUTE_TOOL_ARGS_METRIC]},
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+
+    assert result["accepted"] is False
+    assert "summary score" in " ".join(result["reasons"])
 
 
 @pytest.mark.parametrize(
@@ -1148,6 +1191,43 @@ def test_validate_inputs_canonicalizes_gold_with_final_text_from_content(
         module.validate_inputs(train, optimizer_dev, validation)
 
 
+def test_validate_inputs_checks_every_conversation_turn(tmp_path: Path):
+    module = load_pipeline_module()
+    train, optimizer_dev, validation = _copy_public_evalsets(tmp_path)
+    train_payload = load_report(train)
+    dev_payload = load_report(optimizer_dev)
+    shared_turn = {
+        "invocation_id": "shared_second_turn",
+        "user_content": {"parts": [{"text": "shared optimizer-visible turn"}], "role": "user"},
+        "final_response": {"parts": [{"text": '{"shared": true}'}], "role": "model"},
+    }
+    train_payload["eval_cases"][0]["conversation"].append(copy.deepcopy(shared_turn))
+    dev_payload["eval_cases"][0]["conversation"].append(copy.deepcopy(shared_turn))
+    train.write_text(json.dumps(train_payload), encoding="utf-8")
+    optimizer_dev.write_text(json.dumps(dev_payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="input|gold"):
+        module.validate_inputs(train, optimizer_dev, validation)
+
+
+def test_validate_inputs_canonicalizes_structurally_equal_json_gold(tmp_path: Path):
+    module = load_pipeline_module()
+    train, optimizer_dev, validation = _copy_public_evalsets(tmp_path)
+    train_payload = load_report(train)
+    dev_payload = load_report(optimizer_dev)
+    train_payload["eval_cases"][0]["conversation"][0]["final_response"]["parts"] = [
+        {"text": '{"route":"shared","tool":{"name":"x","arguments":{"a":1,"b":2}}}'}
+    ]
+    dev_payload["eval_cases"][0]["conversation"][0]["final_response"]["parts"] = [
+        {"text": '{ "tool": { "arguments": { "b": 2, "a": 1 }, "name": "x" }, "route": "shared" }'}
+    ]
+    train.write_text(json.dumps(train_payload), encoding="utf-8")
+    optimizer_dev.write_text(json.dumps(dev_payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="gold"):
+        module.validate_inputs(train, optimizer_dev, validation)
+
+
 def test_directory_layout_and_assets_exist():
     expected = {
         "README.md",
@@ -1547,6 +1627,95 @@ def test_report_semantics_recompute_case_deltas():
         module.validate_report_schema(report)
 
 
+@pytest.mark.parametrize("field", ["pass_rate", "failed_case_ids", "source"])
+def test_report_semantics_recompute_evaluation_summary_evidence(field: str):
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    summary = report["baseline"]["train"]
+    if field == "pass_rate":
+        summary[field] = 0.123456
+    elif field == "failed_case_ids":
+        summary[field] = [summary["case_results"][0]["case_id"]]
+    else:
+        summary[field] = "fixture"
+
+    with pytest.raises(ValidationError, match="summary"):
+        module.validate_report_schema(report)
+
+
+def test_report_semantics_reject_case_level_aggregate_forgery():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    candidate = next(item for item in report["candidates"] if item["gate"]["accepted"])
+    validation = copy.deepcopy(candidate["validation"])
+    validation["case_results"][0]["score"] = 0.5
+    candidate["validation"] = validation
+    candidate["final_validation"] = copy.deepcopy(validation)
+    candidate["case_deltas"] = module.build_case_deltas(report["baseline"]["validation"], validation)
+
+    with pytest.raises(ValidationError, match="summary score"):
+        module.validate_report_schema(report)
+
+
+def test_report_semantics_recompute_critical_regression_gate_evidence():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    candidate = next(item for item in report["candidates"] if item["gate"]["accepted"])
+    validation = copy.deepcopy(candidate["validation"])
+    critical_case = next(case for case in validation["case_results"] if "critical" in case["tags"])
+    critical_case["score"] = 0.5
+    validation["score"] = round(
+        sum(case["score"] for case in validation["case_results"]) / len(validation["case_results"]),
+        6,
+    )
+    candidate["validation"] = validation
+    candidate["final_validation"] = copy.deepcopy(validation)
+    candidate["delta"]["validation_score"] = module._score_delta(
+        validation["score"],
+        report["baseline"]["validation"]["score"],
+    )
+    candidate["gate"]["validation_delta"] = candidate["delta"]["validation_score"]
+    candidate["case_deltas"] = module.build_case_deltas(report["baseline"]["validation"], validation)
+    report["delta"] = copy.deepcopy(candidate["delta"])
+
+    with pytest.raises(ValidationError, match="gate evidence"):
+        module.validate_report_schema(report)
+
+
+def test_report_semantics_reject_required_metric_status_forgery():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    candidate = next(item for item in report["candidates"] if item["gate"]["accepted"])
+    metric = candidate["validation"]["metrics"][ROUTE_TOOL_ARGS_METRIC]
+    metric["score"] = 0.0
+    candidate["final_validation"] = copy.deepcopy(candidate["validation"])
+
+    with pytest.raises(ValidationError, match="metric"):
+        module.validate_report_schema(report)
+
+
+def test_report_semantics_recompute_aggregate_metrics_from_case_metrics():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    candidate = next(item for item in report["candidates"] if item["gate"]["accepted"])
+    metric = candidate["validation"]["metrics"]["llm_rubric_response"]
+    metric["score"] = 0.75
+    metric["threshold"] = 0.5
+    candidate["final_validation"] = copy.deepcopy(candidate["validation"])
+
+    with pytest.raises(ValidationError, match="aggregate metric"):
+        module.validate_report_schema(report)
+
+
+def test_report_semantics_reconcile_candidate_audit_cost_with_pipeline_cost():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    report["candidates"][0]["audit"]["cost"]["estimated"] = 0.5
+
+    with pytest.raises(ValidationError, match="candidate audit cost"):
+        module.validate_report_schema(report)
+
+
 @pytest.mark.parametrize(
     "contradiction",
     [
@@ -1743,6 +1912,9 @@ def test_report_schema_allows_empty_no_run_case_metrics():
     report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
     report["baseline"]["validation"]["case_results"][0]["metrics"] = {}
     report["baseline"]["final_validation"]["case_results"][0]["metrics"] = {}
+    for summary_name in ("validation", "final_validation"):
+        metric = report["baseline"][summary_name]["metrics"][ROUTE_TOOL_ARGS_METRIC]
+        metric.update({"score": 1.0, "passed": True, "status": "passed"})
 
     module.validate_report_schema(report)
 
@@ -1907,6 +2079,45 @@ def test_prompt_artifact_writers_reject_preexisting_prompts_symlink_escape(
             )
 
     assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("writer", ["report_file", "trace_evalsets_dir"])
+def test_run_artifact_writers_reject_preexisting_symlink_escape(
+    tmp_path: Path,
+    writer: str,
+):
+    module = load_pipeline_module()
+    run_dir = tmp_path / "run"
+    outside = tmp_path / "outside"
+    run_dir.mkdir()
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    try:
+        if writer == "report_file":
+            (run_dir / "optimization_report.json").symlink_to(sentinel)
+        else:
+            (run_dir / "evalsets").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    with pytest.raises(ValueError, match="run_dir|symlink"):
+        if writer == "report_file":
+            report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+            module.write_report(run_dir, report)
+        else:
+            payload = load_report(EXAMPLE_DIR / "train.evalset.json")
+            module.materialize_trace_evalset(
+                source_evalset=EXAMPLE_DIR / "train.evalset.json",
+                payload=payload,
+                outputs={},
+                run_dir=run_dir,
+                candidate_id="candidate",
+                split="train",
+            )
+
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel.txt"]
 
 
 def test_router_prompt_is_instructional_not_a_gold_answer():
@@ -3441,6 +3652,57 @@ def test_online_cost_audit_reconciles_native_and_derived_optimizer_judge_calls()
     assert audit["model_calls"] == 6
 
 
+def test_judge_call_accounting_includes_each_model_sample_and_eval_run():
+    module = load_pipeline_module()
+    metrics_config = {
+        "metrics": [
+            {
+                "metric_name": "llm_multi_judge",
+                "threshold": 0.5,
+                "criterion": {
+                    "llm_judge": {
+                        "judge_models": [
+                            {"model_name": "judge-a", "num_samples": 2},
+                            {"model_name": "judge-b", "num_samples": 3},
+                        ]
+                    }
+                },
+            }
+        ],
+        "num_runs": 2,
+    }
+    summary = {"case_results": [{"case_id": "a"}, {"case_id": "b"}]}
+
+    assert module.judge_calls_per_agent_call(metrics_config) == 5
+    final = module.final_revalidation_call_audit([summary], metrics_config)
+    assert final == {
+        "agent_calls": 4,
+        "judge_calls_per_agent_call": 5,
+        "judge_model_calls": 20,
+        "model_calls": 24,
+    }
+    audit = module.online_cost_audit(
+        _optimizer_result({"prompt": 8, "completion": 2, "total": 10}),
+        optimizer_candidate_agent_calls=2,
+        optimizer_judge_calls_per_agent_call=5,
+        final_revalidation_calls=final,
+    )
+    assert audit["optimizer"]["judge_calls_per_candidate_evaluation"] == 5
+    assert audit["optimizer"]["derived_judge_model_calls"] == 10
+    assert audit["optimizer"]["judge_model_calls"] == 10
+
+
+def test_report_semantics_recompute_derived_judge_calls_from_recorded_multiplier():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    optimizer = report["cost"]["optimizer"]
+    optimizer["candidate_evaluation_agent_calls"] = 2
+    optimizer["judge_calls_per_candidate_evaluation"] = 2
+
+    with pytest.raises(ValidationError, match="derived judge"):
+        module.validate_report_schema(report)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("include_llm_metric", "expected_judge_calls", "expected_optimizer_calls", "expected_source"),
@@ -3607,19 +3869,25 @@ async def test_online_optimizer_validation_improvement_is_accepted(
         return FakeResult()
 
     def summary(score: float, passed: bool) -> dict[str, Any]:
+        metrics = {
+            ROUTE_TOOL_ARGS_METRIC: {
+                "score": score,
+                "threshold": 1.0,
+                "passed": passed,
+                "status": "passed" if passed else "failed",
+            },
+            "llm_rubric_response": {
+                "score": 1.0,
+                "threshold": 0.66,
+                "passed": True,
+                "status": "passed",
+            },
+        }
         return {
             "eval_set_id": "fake",
             "score": score,
-            "pass_rate": 1.0 if passed else 0.5,
-            "metrics": {
-                ROUTE_TOOL_ARGS_METRIC: {
-                    "score": score,
-                    "threshold": 1.0,
-                    "passed": passed,
-                    "status": "passed" if passed else "failed",
-                },
-                "llm_rubric_response": {"score": 1.0, "threshold": 0.66, "passed": True, "status": "passed"},
-            },
+            "pass_rate": 1.0 if passed else 0.0,
+            "metrics": copy.deepcopy(metrics),
             "case_results": [
                 {
                     "case_id": "case_1",
@@ -3627,7 +3895,7 @@ async def test_online_optimizer_validation_improvement_is_accepted(
                     "user": "test user",
                     "score": score,
                     "passed": passed,
-                    "metrics": {},
+                    "metrics": copy.deepcopy(metrics),
                     "actual_text": "",
                     "expected_text": "",
                     "key_trace": {
@@ -3636,8 +3904,8 @@ async def test_online_optimizer_validation_improvement_is_accepted(
                         "expected_final_response": "",
                         "error_message": None,
                     },
-                    "root_cause": "",
-                    "reasons": [],
+                    "root_cause": "" if passed else "metric_failed",
+                    "reasons": [] if passed else ["stubbed metric failure"],
                 },
             ],
             "failed_case_ids": [] if passed else ["case_1"],

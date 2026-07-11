@@ -152,6 +152,60 @@ def validate_report_schema(report: dict[str, Any]) -> None:
     if baseline["validation"] != baseline["final_validation"]:
         reject("baseline validation must equal final_validation")
 
+    def validate_evaluation_summary(summary: dict[str, Any], label: str) -> None:
+        case_results = summary["case_results"]
+        expected_score = round(sum(case["score"] for case in case_results) / len(case_results), 6)
+        if round(summary["score"], 6) != expected_score:
+            reject(f"{label} summary score does not match case-derived score")
+        expected_pass_rate = round(
+            sum(1 for case in case_results if case["passed"]) / len(case_results),
+            6,
+        )
+        if round(summary["pass_rate"], 6) != expected_pass_rate:
+            reject(f"{label} summary pass_rate does not match case results")
+        expected_failed_ids = [case["case_id"] for case in case_results if not case["passed"]]
+        if summary["failed_case_ids"] != expected_failed_ids:
+            reject(f"{label} summary failed_case_ids do not match case results")
+        if summary["source"] != "AgentEvaluator":
+            reject(f"{label} summary source must be AgentEvaluator")
+        for metric_name, metric in summary["metrics"].items():
+            metric_score = _finite_float(metric["score"])
+            metric_threshold = _finite_float(metric["threshold"])
+            if metric_score is None or metric_threshold is None:
+                reject(f"{label} summary metric {metric_name} must have numeric score and threshold")
+            expected_passed = metric_score >= metric_threshold
+            expected_status = "passed" if expected_passed else "failed"
+            if metric["passed"] is not expected_passed or metric["status"].lower() != expected_status:
+                reject(f"{label} summary metric {metric_name} has contradictory score evidence")
+            case_metric_scores: list[float] = []
+            for case in case_results:
+                case_metric = case["metrics"].get(metric_name)
+                if not isinstance(case_metric, Mapping):
+                    continue
+                case_metric_score = _finite_float(case_metric.get("score"))
+                if case_metric_score is None:
+                    continue
+                case_metric_threshold = _finite_float(case_metric.get("threshold"))
+                if case_metric_threshold != metric_threshold:
+                    reject(f"{label} aggregate metric {metric_name} threshold does not match case evidence")
+                case_metric_scores.append(case_metric_score)
+            if not case_metric_scores:
+                reject(f"{label} aggregate metric {metric_name} has no numeric case evidence")
+            expected_metric_score = round(sum(case_metric_scores) / len(case_metric_scores), 6)
+            if round(metric_score, 6) != expected_metric_score:
+                reject(f"{label} aggregate metric {metric_name} score does not match case evidence")
+        for case in case_results:
+            trace = case["key_trace"]
+            if trace["actual_final_response"] != case["actual_text"]:
+                reject(f"{label} case {case['case_id']} key trace actual response does not match")
+            if trace["expected_final_response"] != case["expected_text"]:
+                reject(f"{label} case {case['case_id']} key trace expected response does not match")
+            if case["passed"]:
+                if case["root_cause"] or case["reasons"]:
+                    reject(f"{label} passed case {case['case_id']} must not carry failure attribution")
+            elif case["root_cause"] not in TAXONOMY or not case["reasons"]:
+                reject(f"{label} failed case {case['case_id']} requires an explainable root cause")
+
     def reject_duplicate_cases(summary: dict[str, Any], label: str) -> None:
         case_ids = [case["case_id"] for case in summary["case_results"]]
         duplicates = sorted(case_id for case_id, count in Counter(case_ids).items() if count > 1)
@@ -160,9 +214,37 @@ def validate_report_schema(report: dict[str, Any]) -> None:
 
     for summary_name in ("train", "optimizer_dev", "validation", "final_validation"):
         reject_duplicate_cases(baseline[summary_name], f"baseline.{summary_name}")
+        validate_evaluation_summary(baseline[summary_name], f"baseline.{summary_name}")
+
+    if report["failure_attribution"] != attribution_for(baseline["validation"]):
+        reject("top-level failure attribution does not match baseline validation failures")
+
+    config_snapshot = report["config_snapshot"]
+    recorded_gate_config = config_snapshot.get("gate")
+    if not isinstance(recorded_gate_config, Mapping):
+        reject("config_snapshot.gate must be an object")
+    cost = report["cost"]
+    if report["mode"] == "online":
+        online_duration = report.get("online_duration")
+        if not isinstance(online_duration, Mapping):
+            reject("online report must include online_duration evidence")
+        expected_gate_elapsed = round(
+            online_duration["optimization_seconds"]
+            + online_duration["baseline_revalidation_seconds"]
+            + online_duration["candidate_revalidation_seconds"],
+            6,
+        )
+        if not math.isclose(
+            online_duration["gate_elapsed_seconds"],
+            expected_gate_elapsed,
+            rel_tol=0.0,
+            abs_tol=0.000002,
+        ):
+            reject("online gate elapsed duration does not match recorded phases")
+        if report["duration_seconds"] + 0.000002 < online_duration["gate_elapsed_seconds"]:
+            reject("total duration must cover online gate elapsed duration")
 
     candidates_by_id: dict[str, dict[str, Any]] = {}
-    accepted_candidates: list[dict[str, Any]] = []
     for candidate in report["candidates"]:
         candidate_id = candidate["id"]
         if candidate_id in candidates_by_id:
@@ -175,6 +257,12 @@ def validate_report_schema(report: dict[str, Any]) -> None:
             reject("candidate validation must equal final_validation")
         for summary_name in ("train", "optimizer_dev", "validation", "final_validation"):
             reject_duplicate_cases(candidate[summary_name], f"candidate {candidate_id}.{summary_name}")
+            validate_evaluation_summary(candidate[summary_name], f"candidate {candidate_id}.{summary_name}")
+        for summary_name in ("train", "optimizer_dev"):
+            baseline_case_ids = {case["case_id"] for case in baseline[summary_name]["case_results"]}
+            candidate_case_ids = {case["case_id"] for case in candidate[summary_name]["case_results"]}
+            if candidate_case_ids != baseline_case_ids:
+                reject(f"candidate {candidate_id}.{summary_name} case set must match baseline")
         expected_delta = {
             "train_score": _score_delta(candidate["train"]["score"], baseline["train"]["score"]),
             "optimizer_dev_score": _score_delta(
@@ -193,34 +281,86 @@ def validate_report_schema(report: dict[str, Any]) -> None:
         expected_case_deltas = build_case_deltas(baseline["validation"], candidate["validation"])
         if candidate["case_deltas"] != expected_case_deltas:
             reject(f"candidate case_deltas do not match recomputed validation case deltas: {candidate_id}")
+        if candidate["failure_attribution"] != attribution_for(candidate["validation"]):
+            reject(f"candidate failure attribution does not match validation failures: {candidate_id}")
+
+        candidate_audit = candidate["audit"]
+        if candidate_audit["seed"] != report["seed"]:
+            reject(f"candidate audit seed does not match report seed: {candidate_id}")
+        pipeline_cost = cost["estimated_total"]
+        audit_cost = candidate_audit["cost"]
+        if audit_cost["known"] is not (pipeline_cost is not None) or audit_cost["estimated"] != pipeline_cost:
+            reject(f"candidate audit cost does not match pipeline cost evidence: {candidate_id}")
+        if candidate_audit["duration_seconds"] > report["duration_seconds"]:
+            reject(f"candidate audit duration exceeds total report duration: {candidate_id}")
+
+        gate_duration = candidate_audit["duration_seconds"]
+        if report["mode"] == "online":
+            gate_duration = online_duration.get("gate_elapsed_seconds")
+            if candidate_audit["duration_seconds"] != online_duration["candidate_revalidation_seconds"]:
+                reject("candidate audit duration does not match online candidate revalidation phase")
+        expected_gate = apply_gate(
+            candidate_id=candidate_id,
+            baseline_val=baseline["validation"],
+            candidate_val=candidate["validation"],
+            gate_config=recorded_gate_config,
+            duration_seconds=gate_duration,
+            cost_usd=audit_cost["estimated"] if audit_cost["known"] else None,
+        )
+        if report["mode"] == "online":
+            online_result = report.get("online_result")
+            if not isinstance(online_result, Mapping):
+                reject("online report must include online_result evidence")
+            if online_result.get("status") != "SUCCEEDED":
+                expected_gate["accepted"] = False
+                expected_gate["reasons"].append(f"native optimizer status was {online_result.get('status')}")
+                if online_result.get("error_message"):
+                    expected_gate["reasons"].append(online_result["error_message"])
+            if not cost["optimizer"]["usage_evidence_valid"]:
+                expected_gate["accepted"] = False
+                expected_gate["reasons"].append("optimizer usage evidence was malformed and cannot be audited")
+        if candidate["gate"] != expected_gate:
+            reject(f"candidate gate evidence does not match recomputed gate evidence: {candidate_id}")
         if candidate["gate"]["accepted"]:
             if candidate["gate"]["validation_delta"] <= 0:
                 reject("accepted candidate validation delta must be strictly positive")
-            accepted_candidates.append(candidate)
         candidates_by_id[candidate_id] = candidate
 
-    decision = report["gate_decision"]
-    if decision["accepted"]:
-        winner_id = decision["winner"]
-        winner = candidates_by_id.get(winner_id)
-        if winner is None or not winner["gate"]["accepted"]:
-            reject("accepted gate decision must name an existing accepted candidate")
-        if report["delta"] != winner["delta"]:
-            reject("top-level delta must equal winning candidate delta")
-        if decision["reasons"] != winner["gate"]["reasons"]:
-            reject("top-level reasons must equal winning candidate gate reasons")
+    expected_winner = pick_winner(report["candidates"])
+    if expected_winner is not None:
+        expected_decision = {
+            "accepted": True,
+            "winner": expected_winner["id"],
+            "reasons": expected_winner["gate"]["reasons"],
+        }
+        expected_top_delta = expected_winner["delta"]
     else:
-        if decision["winner"] is not None:
-            reject("rejected gate decision must not name a winner")
-        if accepted_candidates:
-            reject("rejected report must not contain an accepted candidate")
-        if any(value != 0 for value in report["delta"].values()):
-            reject("rejected report must retain the zero-delta contract")
+        rejection_reasons = ["no candidate passed all gates"]
+        for candidate in report["candidates"]:
+            rejection_reasons.extend(f"{candidate['id']}: {reason}" for reason in candidate["gate"]["reasons"])
+        expected_decision = {
+            "accepted": False,
+            "winner": None,
+            "reasons": rejection_reasons,
+        }
+        expected_top_delta = {
+            "validation_score": 0.0,
+            "optimizer_dev_score": 0.0,
+            "train_score": 0.0,
+        }
+    if report["gate_decision"] != expected_decision:
+        reject("top-level gate decision does not match recomputed candidate decisions")
+    if report["delta"] != expected_top_delta:
+        reject("top-level delta does not match recomputed winner delta")
 
-    cost = report["cost"]
     optimizer_cost = cost["optimizer"]
     native_judge_calls = optimizer_cost["native_judge_model_calls"]
     derived_judge_calls = optimizer_cost["derived_judge_model_calls"]
+    expected_derived_judge_calls = (
+        optimizer_cost["candidate_evaluation_agent_calls"] * optimizer_cost["judge_calls_per_candidate_evaluation"]
+    )
+    if derived_judge_calls != expected_derived_judge_calls:
+        reject("optimizer derived judge calls do not match candidate calls and recorded multiplier")
     expected_judge_calls = max(native_judge_calls, derived_judge_calls)
     if optimizer_cost["judge_model_calls"] != expected_judge_calls:
         reject("optimizer judge_model_calls must reconcile native and derived counts without double counting")
@@ -246,6 +386,9 @@ def validate_report_schema(report: dict[str, Any]) -> None:
     if optimizer_cost["model_calls"] != expected_optimizer_calls:
         reject("optimizer model_calls must equal candidate, reflection, and judge calls")
     final_cost = cost["final_revalidation"]
+    expected_final_judge_calls = final_cost["agent_calls"] * final_cost["judge_calls_per_agent_call"]
+    if final_cost["judge_model_calls"] != expected_final_judge_calls:
+        reject("final revalidation judge calls do not match agent calls and recorded multiplier")
     if final_cost["model_calls"] != final_cost["agent_calls"] + final_cost["judge_model_calls"]:
         reject("final revalidation model_calls must equal agent plus judge calls")
     expected_model_calls = cost["optimizer"]["model_calls"] + cost["final_revalidation"]["model_calls"]
@@ -794,6 +937,22 @@ def final_text_from_content(content: Any) -> str:
     ).strip()
 
 
+def canonical_gold_evidence(content: Any) -> str:
+    visible_text = final_text_from_content(content)
+    try:
+        parsed = json.loads(visible_text)
+        canonical = json.dumps(
+            parsed,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "text:" + " ".join(visible_text.split())
+    return "json:" + canonical
+
+
 _SENSITIVE_REPORT_TEXT = re.compile(
     r"""\b(?:
         authorization|proxy-authorization|bearer|set-cookie|cookies?|headers?|
@@ -857,12 +1016,17 @@ def load_gate_config(
     required_source = "default"
     path_payload: dict[str, Any] = {}
     if path is not None:
-        path_payload = load_json(path)
+        raw_path_payload = load_json(path)
+        if not isinstance(raw_path_payload, Mapping):
+            raise ValueError("gate config must be a JSON object")
+        path_payload = dict(raw_path_payload)
         config.update(path_payload)
         if "required_metrics" in path_payload:
             required_source = "gate_config"
-    if overrides:
-        config.update(overrides)
+    if overrides is not None:
+        if not isinstance(overrides, Mapping):
+            raise ValueError("gate config overrides must be a mapping")
+        config.update(dict(overrides))
         if "required_metrics" in overrides:
             required_source = "override"
     if optimizer_config is not None and required_source == "default":
@@ -916,34 +1080,37 @@ def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalse
                 raise ValueError(f"{prefix}.eval_id must be a non-empty string")
             if case_id in role_evidence["id"]:
                 raise ValueError(f"{role} evalset contains duplicate eval_id: {case_id}")
-            if not isinstance(conversation, list) or not conversation or not isinstance(conversation[0], dict):
+            if not isinstance(conversation, list) or not conversation:
                 raise ValueError(f"{prefix}.conversation must be a non-empty array of objects")
-            invocation = conversation[0]
-            user_content = invocation.get("user_content")
-            final_response = invocation.get("final_response")
-            if not isinstance(user_content, dict) or not isinstance(user_content.get("parts"), list):
-                raise ValueError(f"{prefix} must contain user_content.parts as an array")
-            if not isinstance(final_response, dict) or not isinstance(final_response.get("parts"), list):
-                raise ValueError(f"{prefix} must contain final_response.parts as an array")
-            user_parts = user_content["parts"]
-            gold_parts = final_response["parts"]
-            if not user_parts or not all(
-                isinstance(part, dict) and isinstance(part.get("text"), str) for part in user_parts
-            ):
-                raise ValueError(f"{prefix} user_content.parts must contain text strings")
-            if not gold_parts or not all(
-                isinstance(part, dict) and isinstance(part.get("text"), str) for part in gold_parts
-            ):
-                raise ValueError(f"{prefix} final_response.parts must contain text strings")
-            normalized_input = " ".join("".join(part["text"] for part in user_parts).split()).casefold()
-            exact_gold = final_text_from_content(final_response)
-            if not normalized_input:
-                raise ValueError(f"{prefix} normalized user input must be non-empty")
-            if not exact_gold:
-                raise ValueError(f"{prefix} visible final response must be non-empty")
             role_evidence["id"].add(case_id)
-            role_evidence["input"].add(normalized_input)
-            role_evidence["gold"].add(exact_gold)
+            for invocation_position, invocation in enumerate(conversation):
+                invocation_prefix = f"{prefix}.conversation[{invocation_position}]"
+                if not isinstance(invocation, dict):
+                    raise ValueError(f"{invocation_prefix} must be an object")
+                user_content = invocation.get("user_content")
+                final_response = invocation.get("final_response")
+                if not isinstance(user_content, dict) or not isinstance(user_content.get("parts"), list):
+                    raise ValueError(f"{invocation_prefix} must contain user_content.parts as an array")
+                if not isinstance(final_response, dict) or not isinstance(final_response.get("parts"), list):
+                    raise ValueError(f"{invocation_prefix} must contain final_response.parts as an array")
+                user_parts = user_content["parts"]
+                gold_parts = final_response["parts"]
+                if not user_parts or not all(
+                    isinstance(part, dict) and isinstance(part.get("text"), str) for part in user_parts
+                ):
+                    raise ValueError(f"{invocation_prefix} user_content.parts must contain text strings")
+                if not gold_parts or not all(
+                    isinstance(part, dict) and isinstance(part.get("text"), str) for part in gold_parts
+                ):
+                    raise ValueError(f"{invocation_prefix} final_response.parts must contain text strings")
+                normalized_input = " ".join("".join(part["text"] for part in user_parts).split()).casefold()
+                visible_gold = final_text_from_content(final_response)
+                if not normalized_input:
+                    raise ValueError(f"{invocation_prefix} normalized user input must be non-empty")
+                if not visible_gold:
+                    raise ValueError(f"{invocation_prefix} visible final response must be non-empty")
+                role_evidence["input"].add(normalized_input)
+                role_evidence["gold"].add(canonical_gold_evidence(final_response))
         evidence[role] = role_evidence
 
     for left_role, right_role in role_pairs:
@@ -969,15 +1136,30 @@ def _validate_safe_path_component(value: Any, *, label: str) -> str:
 def _resolved_artifact_child(parent: Path, component: str, *, label: str) -> Path:
     safe_component = _validate_safe_path_component(component, label=label)
     resolved_parent = parent.resolve()
-    resolved_child = (resolved_parent / safe_component).resolve()
+    child = resolved_parent / safe_component
+    if child.is_symlink():
+        raise ValueError(f"resolved {label} artifact path must not be a symlink")
+    resolved_child = child.resolve()
     if not resolved_child.is_relative_to(resolved_parent):
         raise ValueError(f"resolved {label} artifact path must stay beneath its parent")
     return resolved_child
 
 
 def _resolved_run_descendant(run_dir: Path, *components: str, label: str) -> Path:
+    if run_dir.is_symlink():
+        raise ValueError(f"resolved {label} must remain beneath run_dir and must not traverse a symlink")
+    lexical_descendant = run_dir.joinpath(*components)
+    try:
+        relative_parts = lexical_descendant.relative_to(run_dir).parts
+    except ValueError as error:
+        raise ValueError(f"resolved {label} must remain beneath run_dir") from error
+    cursor = run_dir
+    for component in relative_parts:
+        cursor = cursor / component
+        if cursor.is_symlink():
+            raise ValueError(f"resolved {label} must remain beneath run_dir and must not traverse a symlink")
     resolved_run_dir = run_dir.resolve()
-    resolved_descendant = run_dir.joinpath(*components).resolve()
+    resolved_descendant = lexical_descendant.resolve()
     if not resolved_descendant.is_relative_to(resolved_run_dir):
         raise ValueError(f"resolved {label} must remain beneath run_dir")
     return resolved_descendant
@@ -996,13 +1178,13 @@ def make_run_dir(output_dir: Path | None, run_id: str) -> Path:
 
 
 def offline_metrics_path(run_dir: Path) -> Path:
-    path = run_dir / "offline_metrics.json"
+    path = _resolved_run_descendant(run_dir, "offline_metrics.json", label="offline metrics artifact")
     write_json(path, OFFLINE_METRICS_CONFIG)
     return path
 
 
 def online_metrics_path(run_dir: Path, optimizer_config: Path) -> Path:
-    path = run_dir / "online_eval_metrics.json"
+    path = _resolved_run_descendant(run_dir, "online_eval_metrics.json", label="online metrics artifact")
     write_json(path, load_json(optimizer_config)["evaluate"])
     return path
 
@@ -1290,8 +1472,6 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
     case_by_id = {case["eval_id"]: case for case in evalset_payload["eval_cases"]}
     eval_set_id, set_result = next(iter(result.results_by_eval_set_id.items()))
     case_results: list[dict[str, Any]] = []
-    metric_scores: dict[str, list[float]] = {}
-    metric_thresholds: dict[str, float] = {}
 
     for case in evalset_payload["eval_cases"]:
         eval_id = case["eval_id"]
@@ -1330,7 +1510,8 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
 
         run_scores: list[float] = []
         run_passed = True
-        merged_metrics: dict[str, dict[str, Any]] = {}
+        metric_run_scores: dict[str, list[float]] = {}
+        metric_evidence: dict[str, dict[str, Any]] = {}
         actual_text, expected_text = _extract_actual_expected(runs[0], case_by_id[eval_id])
         error_message = None
         for run in runs:
@@ -1343,10 +1524,9 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
                 details = getattr(metric, "details", None)
                 reason = getattr(details, "reason", None) if details is not None else None
                 threshold = float(metric.threshold)
-                metric_thresholds[metric.metric_name] = threshold
                 if score is not None:
-                    metric_scores.setdefault(metric.metric_name, []).append(float(score))
-                merged_metrics[metric.metric_name] = {
+                    metric_run_scores.setdefault(metric.metric_name, []).append(float(score))
+                metric_evidence[metric.metric_name] = {
                     "score": None if score is None else float(score),
                     "threshold": threshold,
                     "status": _status_name(metric.eval_status),
@@ -1355,6 +1535,22 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
                 }
                 if metric.metric_name == PRIMARY_METRIC and score is not None:
                     run_scores.append(float(score))
+
+        merged_metrics: dict[str, dict[str, Any]] = {}
+        for metric_name, evidence in metric_evidence.items():
+            scores = metric_run_scores.get(metric_name, [])
+            if scores:
+                average_score = sum(scores) / len(scores)
+                threshold = evidence["threshold"]
+                passed = average_score >= threshold
+                merged_metrics[metric_name] = {
+                    **evidence,
+                    "score": round(average_score, 6),
+                    "passed": passed,
+                    "status": "passed" if passed else "failed",
+                }
+            else:
+                merged_metrics[metric_name] = evidence
 
         if not run_scores:
             run_scores = [
@@ -1393,6 +1589,16 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
     total = len(case_results)
     score = sum(item["score"] for item in case_results) / total if total else 0.0
     pass_rate = sum(1 for item in case_results if item["passed"]) / total if total else 0.0
+    metric_scores: dict[str, list[float]] = {}
+    metric_thresholds: dict[str, float] = {}
+    for case_result in case_results:
+        for metric_name, metric in case_result["metrics"].items():
+            metric_score = _finite_float(metric.get("score"))
+            metric_threshold = _finite_float(metric.get("threshold"))
+            if metric_score is not None:
+                metric_scores.setdefault(metric_name, []).append(metric_score)
+            if metric_threshold is not None:
+                metric_thresholds[metric_name] = metric_threshold
     metrics_summary: dict[str, dict[str, Any]] = {}
     for name, scores in metric_scores.items():
         threshold = metric_thresholds.get(name, 1.0)
@@ -1591,10 +1797,21 @@ def materialize_trace_evalset(
         }
         case["actual_conversation"] = [actual_invocation]
     trace_name = f"{candidate_id}.{split}.trace.evalset.json"
-    path = _resolved_artifact_child(run_dir / "evalsets", trace_name, label="trace artifact name")
+    _validate_safe_path_component(trace_name, label="trace artifact name")
+    path = _resolved_run_descendant(
+        run_dir,
+        "evalsets",
+        trace_name,
+        label="trace evalset artifact",
+    )
     write_json(path, trace_payload)
     if candidate_id == "candidate_local_patch" and split == "validation":
-        write_json(run_dir / "trace_evalset.json", trace_payload)
+        trace_alias_path = _resolved_run_descendant(
+            run_dir,
+            "trace_evalset.json",
+            label="trace evalset alias artifact",
+        )
+        write_json(trace_alias_path, trace_payload)
     return path, trace_payload
 
 
@@ -1739,6 +1956,21 @@ def _index_gate_cases(
     return indexed, issues
 
 
+def _case_derived_summary_score(evaluation: Mapping[str, Any]) -> float | None:
+    cases = evaluation.get("case_results")
+    if not isinstance(cases, list) or not cases:
+        return None
+    scores: list[float] = []
+    for case in cases:
+        if not isinstance(case, Mapping):
+            return None
+        score = _finite_float(case.get("score"))
+        if score is None or not 0 <= score <= 1:
+            return None
+        scores.append(score)
+    return round(sum(scores) / len(scores), 6)
+
+
 def _normalized_gate_tags(case: dict[str, Any]) -> set[str]:
     tags = case.get("tags", [])
     if not isinstance(tags, list):
@@ -1816,6 +2048,19 @@ def apply_gate(
             if not isinstance(case.get("tags", []), list):
                 accepted = False
                 reasons.append(f"{label} case {case_id} tags must be an array")
+
+    for label, summary in (("baseline", normalized_baseline), ("candidate", normalized_candidate)):
+        expected_summary_score = _case_derived_summary_score(summary)
+        reported_summary_score = _finite_float(summary.get("score"))
+        if expected_summary_score is None:
+            accepted = False
+            reasons.append(f"{label} summary score could not be derived from non-empty valid case results")
+        elif reported_summary_score is not None and round(reported_summary_score, 6) != expected_summary_score:
+            accepted = False
+            reasons.append(
+                f"{label} summary score {reported_summary_score:.6f} does not match "
+                f"case-derived score {expected_summary_score:.6f}"
+            )
 
     baseline_score = _finite_float(normalized_baseline.get("score"))
     candidate_score = _finite_float(normalized_candidate.get("score"))
@@ -1937,7 +2182,20 @@ def apply_gate(
     missing_or_failed = []
     for name in required:
         metric = candidate_metrics.get(name)
-        if not isinstance(metric, dict) or metric.get("passed") is not True:
+        metric_consistent = isinstance(metric, dict) and metric.get("passed") is True
+        if metric_consistent and ("score" in metric or "threshold" in metric):
+            metric_score = _finite_float(metric.get("score"))
+            metric_threshold = _finite_float(metric.get("threshold"))
+            metric_consistent = (
+                metric_score is not None
+                and 0 <= metric_score <= 1
+                and metric_threshold is not None
+                and metric_threshold >= 0
+                and metric_score >= metric_threshold
+            )
+        if metric_consistent and "status" in metric:
+            metric_consistent = str(metric.get("status", "")).lower() == "passed"
+        if not metric_consistent:
             missing_or_failed.append(name)
     if missing_or_failed:
         accepted = False
@@ -1997,12 +2255,16 @@ def build_candidate_report(
     prompt_artifacts: list[dict[str, Any]] | None = None,
     artifacts: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    observed_gate_duration = round(
+        duration_seconds if gate_duration_seconds is None else gate_duration_seconds,
+        6,
+    )
     gate = apply_gate(
         candidate_id=candidate_id,
         baseline_val=baseline_val,
         candidate_val=validation,
         gate_config=gate_config,
-        duration_seconds=duration_seconds if gate_duration_seconds is None else gate_duration_seconds,
+        duration_seconds=observed_gate_duration,
         cost_usd=cost_usd,
     )
     return _json_safe(
@@ -2213,7 +2475,12 @@ async def build_offline_report(
     metrics_path = offline_metrics_path(run_dir)
     source_prompts = read_source_prompts(system_prompt, router_prompt)
     if mode == "trace":
-        write_json(run_dir / "trace_metrics.json", OFFLINE_METRICS_CONFIG)
+        trace_metrics_path = _resolved_run_descendant(
+            run_dir,
+            "trace_metrics.json",
+            label="trace metrics artifact",
+        )
+        write_json(trace_metrics_path, OFFLINE_METRICS_CONFIG)
 
     baseline_fixture = fixtures["baseline"]
     baseline_train, baseline_train_artifacts = await evaluate_fixture_split(
@@ -2393,6 +2660,7 @@ async def build_offline_report(
                 "model_calls": 0,
                 "candidate_evaluation_agent_calls": 0,
                 "reflection_lm_calls": 0,
+                "judge_calls_per_candidate_evaluation": 0,
                 "judge_model_calls": 0,
                 "native_judge_model_calls": 0,
                 "derived_judge_model_calls": 0,
@@ -2419,6 +2687,7 @@ async def build_offline_report(
             "final_revalidation": {
                 "estimated_cost": 0.0,
                 "agent_calls": 0,
+                "judge_calls_per_agent_call": 0,
                 "judge_model_calls": 0,
                 "model_calls": 0,
                 "token_usage": {
@@ -2571,17 +2840,41 @@ def _is_llm_metric(metric: dict[str, Any]) -> bool:
     return name.startswith("llm_") or "llm_judge" in criterion or "llmJudge" in criterion
 
 
+def judge_calls_per_agent_call(metrics_config: Mapping[str, Any]) -> int:
+    from trpc_agent_sdk.evaluation._eval_config import EvalConfig
+    from trpc_agent_sdk.evaluation._llm_criterion import get_llm_criterion_from_metric
+
+    try:
+        eval_config = EvalConfig.model_validate(dict(metrics_config))
+    except Exception as error:
+        raise ValueError(f"invalid evaluation metrics config: {error}") from error
+
+    total = 0
+    for metric in eval_config.get_eval_metrics():
+        criterion = get_llm_criterion_from_metric(metric)
+        if criterion is not None:
+            judge_models = criterion.get_judge_models()
+            if not judge_models:
+                raise ValueError(f"LLM metric {metric.metric_name} has no judge model")
+            total += sum(model.get_num_samples() for model in judge_models)
+        elif str(metric.metric_name).startswith("llm_"):
+            total += 1
+    return total
+
+
 def final_revalidation_call_audit(
     summaries: list[dict[str, Any]],
     metrics_config: dict[str, Any],
 ) -> dict[str, int]:
-    metrics = metrics_config.get("metrics") or []
-    num_runs = int(metrics_config.get("num_runs", 1) or 1)
+    num_runs, invalid_num_runs = _normalized_round_count(metrics_config.get("num_runs", 1))
+    if invalid_num_runs or num_runs <= 0:
+        raise ValueError("evaluation num_runs must be a positive integer")
     case_runs = sum(len(summary.get("case_results", [])) for summary in summaries) * num_runs
-    llm_metric_count = sum(1 for metric in metrics if isinstance(metric, dict) and _is_llm_metric(metric))
-    judge_calls = case_runs * llm_metric_count
+    judge_multiplier = judge_calls_per_agent_call(metrics_config)
+    judge_calls = case_runs * judge_multiplier
     return {
         "agent_calls": case_runs,
+        "judge_calls_per_agent_call": judge_multiplier,
         "judge_model_calls": judge_calls,
         "model_calls": case_runs + judge_calls,
     }
@@ -2591,14 +2884,20 @@ def online_cost_audit(
     result: Any,
     *,
     optimizer_candidate_agent_calls: int,
-    optimizer_llm_metric_count: int,
     final_revalidation_calls: dict[str, int],
+    optimizer_judge_calls_per_agent_call: int | None = None,
+    optimizer_llm_metric_count: int | None = None,
 ) -> dict[str, Any]:
     reflection_calls, invalid_reflection_calls = _count_attr(result, "total_reflection_lm_calls")
     native_judge_calls, invalid_judge_calls = _count_attr(result, "total_judge_model_calls")
     candidate_calls, invalid_candidate_calls = _normalized_round_count(optimizer_candidate_agent_calls)
-    llm_metric_count, invalid_llm_metric_count = _normalized_round_count(optimizer_llm_metric_count)
-    derived_judge_calls = candidate_calls * llm_metric_count
+    legacy_multiplier_conflict = False
+    if optimizer_judge_calls_per_agent_call is None:
+        optimizer_judge_calls_per_agent_call = optimizer_llm_metric_count or 0
+    elif optimizer_llm_metric_count is not None and optimizer_llm_metric_count != optimizer_judge_calls_per_agent_call:
+        legacy_multiplier_conflict = True
+    judge_multiplier, invalid_judge_multiplier = _normalized_round_count(optimizer_judge_calls_per_agent_call)
+    derived_judge_calls = candidate_calls * judge_multiplier
     judge_calls = max(native_judge_calls, derived_judge_calls)
     if native_judge_calls and derived_judge_calls:
         judge_call_source = (
@@ -2624,7 +2923,8 @@ def online_cost_audit(
         invalid_reflection_calls
         or invalid_judge_calls
         or invalid_candidate_calls
-        or invalid_llm_metric_count
+        or invalid_judge_multiplier
+        or legacy_multiplier_conflict
         or invalid_token_usage
         or invalid_cost
     )
@@ -2673,6 +2973,7 @@ def online_cost_audit(
             "model_calls": optimizer_calls,
             "candidate_evaluation_agent_calls": candidate_calls,
             "reflection_lm_calls": reflection_calls,
+            "judge_calls_per_candidate_evaluation": judge_multiplier,
             "judge_model_calls": judge_calls,
             "native_judge_model_calls": native_judge_calls,
             "derived_judge_model_calls": derived_judge_calls,
@@ -2787,13 +3088,18 @@ async def run_online(
     router_path = resolve_path(router_prompt, ROUTER_PROMPT_PATH)
     validate_inputs(train_path, optimizer_dev_path, val_path)
     optimizer_evaluate_config = validated_optimizer_evaluate_config(optimizer_path)
-    optimizer_llm_metric_count = sum(
-        1 for metric in optimizer_evaluate_config["metrics"] if isinstance(metric, dict) and _is_llm_metric(metric)
-    )
+    optimizer_judge_multiplier = judge_calls_per_agent_call(optimizer_evaluate_config)
     gate = load_gate_config(gate_config_path, gate_config, optimizer_config=optimizer_path)
     source_prompts = read_source_prompts(system_path, router_path)
 
-    online_dir = run_dir / "online"
+    online_dir = _resolved_run_descendant(
+        run_dir,
+        "online",
+        label="online optimizer artifact directory",
+    )
+    if online_dir.exists():
+        raise ValueError("online optimizer artifact directory must not already exist")
+    online_dir.mkdir()
     target = TargetPrompt().add_path("system_prompt", str(system_path)).add_path("router_prompt", str(router_path))
     optimizer_candidate_agent_calls = 0
     optimizer_call_agent = make_online_call_agent(system_prompt=system_path, router_prompt=router_path)
@@ -2880,7 +3186,7 @@ async def run_online(
     cost = online_cost_audit(
         result,
         optimizer_candidate_agent_calls=optimizer_candidate_agent_calls,
-        optimizer_llm_metric_count=optimizer_llm_metric_count,
+        optimizer_judge_calls_per_agent_call=optimizer_judge_multiplier,
         final_revalidation_calls=final_revalidation_call_audit(
             [
                 baseline_train,
@@ -3098,8 +3404,18 @@ def render_markdown(report: dict[str, Any]) -> str:
 
 def write_report(run_dir: Path, report: dict[str, Any]) -> None:
     validate_report_schema(report)
-    write_json(run_dir / "optimization_report.json", report)
-    (run_dir / "optimization_report.md").write_text(render_markdown(report), encoding="utf-8")
+    json_path = _resolved_run_descendant(
+        run_dir,
+        "optimization_report.json",
+        label="JSON report artifact",
+    )
+    markdown_path = _resolved_run_descendant(
+        run_dir,
+        "optimization_report.md",
+        label="Markdown report artifact",
+    )
+    write_json(json_path, report)
+    markdown_path.write_text(render_markdown(report), encoding="utf-8")
 
 
 async def amain(argv: list[str] | None = None) -> Path:

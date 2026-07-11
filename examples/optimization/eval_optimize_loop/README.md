@@ -61,9 +61,12 @@ optimization, baseline revalidation, and candidate revalidation. The separate
 `online_duration` fields retain those phase durations, while each candidate's
 audit retains its own revalidation duration. Optimizer `model_calls` includes
 candidate-evaluation agent calls, reflection calls, and judge calls. Optimizer
-judge calls are derived from counted candidate evaluations and validated LLM
-metrics; a nonzero native counter is reconciled with the derived count without
-double counting, and `judge_model_call_source` records the source. Because
+judge calls are derived from counted candidate evaluations and every configured
+judge model sample. `judge_calls_per_candidate_evaluation` records that
+multiplier; a nonzero native counter is reconciled with the derived count
+without double counting, and `judge_model_call_source` records the source.
+Final revalidation records the corresponding `judge_calls_per_agent_call`.
+Because
 `AgentOptimizer` does not expose token or cost usage for candidate-evaluation
 or judge calls, optimizer phase totals are `null` and marked unknown whenever
 those calls occur. `optimizer.reflection_reported_usage` preserves the native
@@ -95,7 +98,9 @@ gate inherits `optimize.stop.required_metrics` from `optimizer.json`.
 Gate booleans require JSON booleans, numeric thresholds require finite
 non-negative JSON numbers, and malformed values reject without raising. The
 three evalset roles must be different files with no byte-identical content and
-no overlap in case IDs, normalized user inputs, or exact gold outputs.
+no overlap in case IDs, normalized user inputs, or canonical gold outputs.
+Overlap checks cover every conversation turn and canonicalize valid JSON by
+structure, so whitespace and key ordering cannot hide shared gold data.
 
 The deterministic metric in this example is `route_tool_args_score`: it parses
 the final JSON response and scores only `route`, `tool.name`, and
@@ -116,7 +121,9 @@ Report error text redacts provider URLs, configured provider credentials,
 standalone provider-key shapes, and semantic credential markers while retaining
 ordinary error context. Run IDs, candidate IDs, and optimizer prompt artifact
 names also reject or normalize Windows reserved device basenames on every
-platform.
+platform. Before each write, report, metrics, trace, prompt, and optimizer
+output paths are resolved beneath the run directory; pre-existing symlink
+redirection is rejected.
 
 `optimizer_dev.evalset.json` is the optimizer-internal holdout passed to
 `AgentOptimizer.optimize(..., validation_dataset_path=...)`. `val.evalset.json`

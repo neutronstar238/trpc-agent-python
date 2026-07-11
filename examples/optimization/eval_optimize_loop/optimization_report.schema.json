@@ -441,6 +441,7 @@
         "model_calls",
         "candidate_evaluation_agent_calls",
         "reflection_lm_calls",
+        "judge_calls_per_candidate_evaluation",
         "judge_model_calls",
         "native_judge_model_calls",
         "derived_judge_model_calls",
@@ -456,6 +457,7 @@
         "model_calls": {"type": "integer", "minimum": 0},
         "candidate_evaluation_agent_calls": {"type": "integer", "minimum": 0},
         "reflection_lm_calls": {"type": "integer", "minimum": 0},
+        "judge_calls_per_candidate_evaluation": {"type": "integer", "minimum": 0},
         "judge_model_calls": {"type": "integer", "minimum": 0},
         "native_judge_model_calls": {"type": "integer", "minimum": 0},
         "derived_judge_model_calls": {"type": "integer", "minimum": 0},
@@ -506,6 +508,7 @@
       "required": [
         "estimated_cost",
         "agent_calls",
+        "judge_calls_per_agent_call",
         "judge_model_calls",
         "model_calls",
         "token_usage",
@@ -515,6 +518,7 @@
       "properties": {
         "estimated_cost": {"type": ["number", "null"], "minimum": 0},
         "agent_calls": {"type": "integer", "minimum": 0},
+        "judge_calls_per_agent_call": {"type": "integer", "minimum": 0},
         "judge_model_calls": {"type": "integer", "minimum": 0},
         "model_calls": {"type": "integer", "minimum": 0},
         "token_usage": {
