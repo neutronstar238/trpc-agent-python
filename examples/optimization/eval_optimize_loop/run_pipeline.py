@@ -194,11 +194,16 @@ def _normalized_round_identifier(value: Any) -> tuple[int, bool]:
 
 
 def _normalized_round_list(value: Any) -> tuple[list[Any], bool]:
-    if isinstance(value, list):
-        return list(value), False
-    if isinstance(value, tuple):
-        return list(value), False
-    return [], True
+    if not isinstance(value, (list, tuple)):
+        return [], True
+    normalized_values: list[str] = []
+    invalid_member = False
+    for member in value:
+        if isinstance(member, str):
+            normalized_values.append(member)
+        else:
+            invalid_member = True
+    return normalized_values, invalid_member
 
 
 def _prompt_sort_key(item: tuple[Any, Any]) -> tuple[str, str]:
@@ -206,10 +211,13 @@ def _prompt_sort_key(item: tuple[Any, Any]) -> tuple[str, str]:
     return type(name).__name__, repr(name)
 
 
-def _normalized_prompt_artifact_key(name: Any, used_names: set[str]) -> tuple[str, bool]:
+def _normalized_prompt_artifact_key(
+    name: Any,
+    used_names: set[str],
+) -> tuple[str, bool, bool]:
     if isinstance(name, str) and name in {"system_prompt", "router_prompt"}:
         used_names.add(name)
-        return name, False
+        return name, False, False
     if isinstance(name, str):
         normalized_name = Path(name).name
         normalized_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", normalized_name)
@@ -221,10 +229,13 @@ def _normalized_prompt_artifact_key(name: Any, used_names: set[str]) -> tuple[st
 
     base_name = normalized_name
     suffix = 2
-    while normalized_name in used_names:
+    casefold_collision = False
+    used_casefold_names = {used_name.casefold() for used_name in used_names}
+    while normalized_name.casefold() in used_casefold_names:
+        casefold_collision = True
         normalized_name = f"{base_name}__{suffix}"
         suffix += 1
-    return normalized_name, normalized_name != name
+    return normalized_name, normalized_name != name, casefold_collision
 
 
 def write_optimizer_round_artifacts(
@@ -273,7 +284,7 @@ def write_optimizer_round_artifacts(
             if isinstance(raw_name, str) and raw_name in {"system_prompt", "router_prompt"}
         }
         for raw_name, raw_content in raw_prompt_items:
-            name, name_was_normalized = _normalized_prompt_artifact_key(
+            name, name_was_normalized, casefold_collision = _normalized_prompt_artifact_key(
                 raw_name,
                 used_prompt_names,
             )
@@ -282,6 +293,10 @@ def write_optimizer_round_artifacts(
                 invalid_prompt_evidence = True
                 if "prompt artifact key was normalized safely" not in prompt_reasons:
                     prompt_reasons.append("prompt artifact key was normalized safely")
+            if casefold_collision:
+                invalid_prompt_evidence = True
+                if "prompt filenames collided case-insensitively" not in prompt_reasons:
+                    prompt_reasons.append("prompt filenames collided case-insensitively and were disambiguated")
             if isinstance(raw_content, str):
                 content = raw_content
             else:
@@ -306,9 +321,13 @@ def write_optimizer_round_artifacts(
         if not isinstance(raw_metric_breakdown, dict):
             raw_metric_breakdown = {}
             invalid_numeric_evidence = True
+        invalid_mapping_key_evidence = False
         for name, value in raw_metric_breakdown.items():
+            if not isinstance(name, str):
+                invalid_mapping_key_evidence = True
+                continue
             normalized, invalid = _normalized_round_number(value)
-            metric_breakdown[str(name)] = normalized
+            metric_breakdown[name] = normalized
             invalid_numeric_evidence = invalid_numeric_evidence or invalid
         cost_usd, invalid_cost = _normalized_round_number(
             getattr(round_record, "round_llm_cost", None),
@@ -325,8 +344,11 @@ def write_optimizer_round_artifacts(
             raw_token_usage = {}
             invalid_numeric_evidence = True
         for name, value in raw_token_usage.items():
+            if not isinstance(name, str):
+                invalid_mapping_key_evidence = True
+                continue
             normalized, invalid = _normalized_round_count(value)
-            token_usage[str(name)] = normalized
+            token_usage[name] = normalized
             invalid_numeric_evidence = invalid_numeric_evidence or invalid
         invalid_collection_evidence = False
         optimized_field_names, invalid_optimized_field_names = _normalized_round_list(
@@ -360,6 +382,7 @@ def write_optimizer_round_artifacts(
             or invalid_prompt_evidence
             or invalid_collection_evidence
             or invalid_reason_evidence
+            or invalid_mapping_key_evidence
         ):
             accepted = False
             if invalid_numeric_evidence:
@@ -374,6 +397,8 @@ def write_optimizer_round_artifacts(
                 decision_reason += "; invalid round collections were normalized and rejected"
             if invalid_reason_evidence:
                 decision_reason += "; invalid round reason fields were ignored and rejected"
+            if invalid_mapping_key_evidence:
+                decision_reason += "; invalid mapping keys were dropped and rejected"
             for prompt_reason in prompt_reasons:
                 decision_reason += f"; {prompt_reason}; round rejected"
         records.append({

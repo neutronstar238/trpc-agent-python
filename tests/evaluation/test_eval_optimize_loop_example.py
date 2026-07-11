@@ -1722,6 +1722,87 @@ def test_optimizer_round_audit_normalizes_malformed_prompt_payloads(
     assert "candidate_prompts" in record["decision_reason"]
 
 
+def test_optimizer_round_audit_disambiguates_casefolded_prompt_filenames(
+    tmp_path: Path,
+):
+    module = load_pipeline_module()
+    records = module.write_optimizer_round_artifacts(
+        run_dir=tmp_path,
+        rounds=[
+            SimpleNamespace(
+                round=1,
+                optimized_field_names=["system_prompt"],
+                candidate_prompts={"Prompt": "first", "prompt": "second"},
+                validation_pass_rate=1.0,
+                metric_breakdown={ROUTE_TOOL_ARGS_METRIC: 1.0},
+                accepted=True,
+                acceptance_reason="accepted",
+                skip_reason=None,
+                error_message=None,
+                failed_case_ids=[],
+                round_llm_cost=0.01,
+                round_token_usage={"prompt": 8, "completion": 2, "total": 10},
+                duration_seconds=0.25,
+            )
+        ],
+    )
+    record = records[0]
+
+    json.dumps(records, allow_nan=False)
+    paths = [Path(path) for path in record["prompt_paths"].values()]
+    assert len(paths) == 2
+    assert len({path.name.casefold() for path in paths}) == 2
+    assert record["accepted"] is False
+    assert "case-insensitive" in record["decision_reason"]
+    contents = {path.read_text(encoding="utf-8") for path in paths}
+    assert contents == {"first", "second"}
+    for key, path_value in record["prompt_paths"].items():
+        content = Path(path_value).read_text(encoding="utf-8")
+        assert record["prompt_sha256"][key] == module.sha256_text(content)
+
+
+def test_optimizer_round_audit_drops_non_string_collection_members_and_mapping_keys(
+    tmp_path: Path,
+):
+    module = load_pipeline_module()
+    invalid_member = object()
+    invalid_metric_key = object()
+    invalid_token_key = object()
+    records = module.write_optimizer_round_artifacts(
+        run_dir=tmp_path,
+        rounds=[
+            SimpleNamespace(
+                round=1,
+                optimized_field_names=["system_prompt", invalid_member, 7],
+                candidate_prompts={"system_prompt": "prompt"},
+                validation_pass_rate=1.0,
+                metric_breakdown={
+                    ROUTE_TOOL_ARGS_METRIC: 1.0,
+                    invalid_metric_key: 0.5,
+                },
+                accepted=True,
+                acceptance_reason="accepted",
+                skip_reason=None,
+                error_message=None,
+                failed_case_ids=["case_1", invalid_member, 9],
+                round_llm_cost=0.01,
+                round_token_usage={"prompt": 8, invalid_token_key: 2},
+                duration_seconds=0.25,
+            )
+        ],
+    )
+    record = records[0]
+
+    json.dumps(records, allow_nan=False)
+    assert record["optimized_field_names"] == ["system_prompt"]
+    assert record["failed_case_ids"] == ["case_1"]
+    assert record["metric_breakdown"] == {ROUTE_TOOL_ARGS_METRIC: 1.0}
+    assert record["token_usage"] == {"prompt": 8}
+    assert record["accepted"] is False
+    assert "invalid round collections" in record["decision_reason"]
+    assert "mapping keys" in record["decision_reason"]
+
+
 @pytest.mark.asyncio
 async def test_online_optimizer_validation_improvement_is_accepted(
     tmp_path: Path,
