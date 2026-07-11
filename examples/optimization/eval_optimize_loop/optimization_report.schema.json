@@ -442,6 +442,9 @@
         "candidate_evaluation_agent_calls",
         "reflection_lm_calls",
         "judge_model_calls",
+        "native_judge_model_calls",
+        "derived_judge_model_calls",
+        "judge_model_call_source",
         "token_usage",
         "token_usage_known",
         "unknown_token_usage_reason",
@@ -454,6 +457,17 @@
         "candidate_evaluation_agent_calls": {"type": "integer", "minimum": 0},
         "reflection_lm_calls": {"type": "integer", "minimum": 0},
         "judge_model_calls": {"type": "integer", "minimum": 0},
+        "native_judge_model_calls": {"type": "integer", "minimum": 0},
+        "derived_judge_model_calls": {"type": "integer", "minimum": 0},
+        "judge_model_call_source": {
+          "enum": [
+            "none",
+            "native_optimizer_counter",
+            "derived_from_candidate_calls_and_llm_metrics",
+            "native_and_derived_agree",
+            "reconciled_native_and_derived_max"
+          ]
+        },
         "token_usage": {
           "oneOf": [
             {"$ref": "#/$defs/tokenUsage"},

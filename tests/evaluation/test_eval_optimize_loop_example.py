@@ -111,6 +111,7 @@ async def _run_stubbed_online(
     run_id: str,
     gate_config: dict[str, Any] | None = None,
     optimizer_agent_calls: int = 0,
+    optimizer_config: Path | None = None,
 ) -> dict[str, Any]:
     monkeypatch.setenv("TRPC_AGENT_API_KEY", "fake-key")
     monkeypatch.setenv("TRPC_AGENT_BASE_URL", "http://localhost/fake")
@@ -153,8 +154,17 @@ async def _run_stubbed_online(
         output_dir=tmp_path,
         run_id=run_id,
         gate_config=gate_config,
+        optimizer_config=optimizer_config,
     )
     return load_report(run_dir / "optimization_report.json")
+
+
+def _write_optimizer_config(tmp_path: Path, *, metrics: list[dict[str, Any]]) -> Path:
+    payload = load_report(EXAMPLE_DIR / "optimizer.json")
+    payload["evaluate"]["metrics"] = metrics
+    path = tmp_path / "optimizer.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def load_pipeline_module() -> Any:
@@ -349,6 +359,86 @@ def test_gate_rejects_invalid_required_metrics_without_raising(required_metrics:
     assert result["accepted"] is False
     assert "required_metrics" in " ".join(result["reasons"])
     json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    ("malformed_field", "malformed_value"),
+    [
+        ("baseline_val", None),
+        ("baseline_val", []),
+        ("candidate_val", "invalid"),
+        ("candidate_val", 1),
+        ("gate_config", None),
+        ("gate_config", []),
+    ],
+)
+def test_apply_gate_rejects_non_mapping_inputs_without_raising(
+    malformed_field: str,
+    malformed_value: Any,
+):
+    module = load_pipeline_module()
+    kwargs: dict[str, Any] = {
+        "candidate_id": "non_mapping",
+        "baseline_val": _gate_summary(
+            0.25,
+            [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}],
+        ),
+        "candidate_val": _gate_summary(
+            0.75,
+            [{"case_id": "a", "score": 0.75, "passed": True, "tags": []}],
+        ),
+        "gate_config": {"required_metrics": [ROUTE_TOOL_ARGS_METRIC]},
+        "duration_seconds": 1.0,
+        "cost_usd": 0.0,
+    }
+    kwargs[malformed_field] = malformed_value
+
+    result = module.apply_gate(**kwargs)
+
+    assert result["accepted"] is False
+    assert "mapping" in " ".join(result["reasons"])
+    json.dumps(result, allow_nan=False)
+
+
+def test_load_gate_config_preserves_invalid_single_metric_string_for_rejection():
+    module = load_pipeline_module()
+    config = module.load_gate_config(overrides={"required_metrics": "metric"})
+
+    assert config["required_metrics"] == "metric"
+    result = module.apply_gate(
+        candidate_id="single_metric_string",
+        baseline_val=_gate_summary(
+            0.25,
+            [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}],
+        ),
+        candidate_val=_gate_summary(
+            0.75,
+            [{"case_id": "a", "score": 0.75, "passed": True, "tags": []}],
+        ),
+        gate_config=config,
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+    assert result["accepted"] is False
+    assert "required_metrics" in " ".join(result["reasons"])
+
+
+@pytest.mark.parametrize(
+    "required_metrics",
+    [1, "metric", [1], [["metric"]], [""], ["metric", "metric"]],
+)
+def test_optimizer_required_metrics_rejects_malformed_values(
+    tmp_path: Path,
+    required_metrics: Any,
+):
+    module = load_pipeline_module()
+    payload = load_report(EXAMPLE_DIR / "optimizer.json")
+    payload["optimize"]["stop"]["required_metrics"] = required_metrics
+    path = tmp_path / "optimizer.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="required_metrics"):
+        module.optimizer_required_metrics(path)
 
 
 def test_gate_rejects_all_required_metrics_when_evidence_is_empty():
@@ -1008,6 +1098,7 @@ def test_validate_inputs_rejects_pairwise_semantic_overlap(tmp_path: Path, overl
     [
         [],
         {},
+        {"eval_cases": []},
         {"eval_cases": "invalid"},
         {"eval_cases": [{}]},
         {"eval_cases": [{"eval_id": "x", "conversation": []}]},
@@ -1019,6 +1110,41 @@ def test_validate_inputs_rejects_invalid_evalset_shapes(tmp_path: Path, payload:
     optimizer_dev.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="optimizer_dev evalset"):
+        module.validate_inputs(train, optimizer_dev, validation)
+
+
+def test_validate_inputs_rejects_duplicate_eval_ids_within_a_split(tmp_path: Path):
+    module = load_pipeline_module()
+    train, optimizer_dev, validation = _copy_public_evalsets(tmp_path)
+    payload = load_report(optimizer_dev)
+    payload["eval_cases"][1]["eval_id"] = payload["eval_cases"][0]["eval_id"]
+    optimizer_dev.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate eval_id"):
+        module.validate_inputs(train, optimizer_dev, validation)
+
+
+@pytest.mark.parametrize("variant", ["thought_part", "split_visible_parts"])
+def test_validate_inputs_canonicalizes_gold_with_final_text_from_content(
+    tmp_path: Path,
+    variant: str,
+):
+    module = load_pipeline_module()
+    train, optimizer_dev, validation = _copy_public_evalsets(tmp_path)
+    train_payload = load_report(train)
+    dev_payload = load_report(optimizer_dev)
+    train_response = train_payload["eval_cases"][0]["conversation"][0]["final_response"]
+    dev_response = dev_payload["eval_cases"][0]["conversation"][0]["final_response"]
+    if variant == "thought_part":
+        dev_response["parts"] = copy.deepcopy(train_response["parts"])
+        dev_response["parts"].append({"text": "private thought", "thought": True})
+    else:
+        train_response["parts"] = [{"text": "visible one\nvisible two"}]
+        dev_response["parts"] = [{"text": "visible one"}, {"text": "visible two"}]
+    train.write_text(json.dumps(train_payload), encoding="utf-8")
+    optimizer_dev.write_text(json.dumps(dev_payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="gold"):
         module.validate_inputs(train, optimizer_dev, validation)
 
 
@@ -1111,7 +1237,10 @@ def test_readme_includes_design_notes_and_sample_report_shape():
     assert "candidate_local_patch" in readme
     assert "candidate_overfit" in readme
     assert "not globally suppressed" in readme
-    assert "cleanup defect" in readme
+    assert "pipeline awaits `Runner.close()`" in readme
+    assert "upstream OpenAI/httpx" in readme
+    assert "warnings remain observable" in readme
+    assert "cleanup warnings are cleanup defects" not in readme
     assert "`tests/conftest.py` ignores" not in readme
     assert "may fail during collection" in readme
 
@@ -1284,7 +1413,8 @@ def test_report_schema_requires_numeric_delta_for_accepted_gate():
     accepted_candidate["gate"]["validation_delta"] = accepted_candidate["delta"]["validation_score"]
     rejected_candidate = next(candidate for candidate in report["candidates"] if not candidate["gate"]["accepted"])
     rejected_candidate["gate"]["validation_delta"] = None
-    module.validate_report_schema(report)
+    with pytest.raises(ValidationError, match="gate validation_delta"):
+        module.validate_report_schema(report)
 
 
 @pytest.mark.parametrize(
@@ -1349,6 +1479,185 @@ def test_report_semantic_validation_rejects_contradictions(contradiction: str):
         report["cost"]["model_calls"] = 1
     else:
         report["cost"]["token_usage"]["total"] = 1
+
+    with pytest.raises(ValidationError):
+        module.validate_report_schema(report)
+
+
+def test_report_semantics_reject_duplicate_candidate_ids():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    duplicate_id = report["candidates"][0]["id"]
+    report["candidates"][1]["id"] = duplicate_id
+    report["candidates"][1]["gate"]["candidate_id"] = duplicate_id
+
+    with pytest.raises(ValidationError, match="duplicate candidate"):
+        module.validate_report_schema(report)
+
+
+@pytest.mark.parametrize(
+    ("owner", "summary_name"),
+    [
+        ("baseline", "train"),
+        ("baseline", "optimizer_dev"),
+        ("baseline", "validation"),
+        ("candidate", "train"),
+        ("candidate", "optimizer_dev"),
+        ("candidate", "validation"),
+    ],
+)
+def test_report_semantics_reject_duplicate_case_ids_in_every_summary(owner: str, summary_name: str):
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    container = report["baseline"] if owner == "baseline" else report["candidates"][0]
+    summary = container[summary_name]
+    summary["case_results"].append(copy.deepcopy(summary["case_results"][0]))
+    if summary_name == "validation":
+        container["final_validation"] = copy.deepcopy(summary)
+
+    with pytest.raises(ValidationError, match="duplicate case_id"):
+        module.validate_report_schema(report)
+
+
+@pytest.mark.parametrize("delta_name", ["train_score", "optimizer_dev_score", "validation_score"])
+def test_report_semantics_recompute_candidate_deltas(delta_name: str):
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    report["candidates"][1]["delta"][delta_name] = 0.123456
+
+    with pytest.raises(ValidationError, match="candidate delta"):
+        module.validate_report_schema(report)
+
+
+def test_report_semantics_require_gate_delta_to_match_candidate_delta():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    report["candidates"][1]["gate"]["validation_delta"] = 0.123456
+
+    with pytest.raises(ValidationError, match="gate validation_delta"):
+        module.validate_report_schema(report)
+
+
+def test_report_semantics_recompute_case_deltas():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    report["candidates"][0]["case_deltas"][0]["change_type"] = "score_improved"
+
+    with pytest.raises(ValidationError, match="case_deltas"):
+        module.validate_report_schema(report)
+
+
+@pytest.mark.parametrize(
+    "contradiction",
+    [
+        "candidate_calls_known",
+        "candidate_calls_missing_scoped_reason",
+        "candidate_calls_missing_top_cost_reason",
+        "candidate_calls_missing_top_token_reason",
+        "optimizer_unknown_not_propagated",
+        "final_unknown_not_propagated",
+        "top_unknown_with_known_scopes",
+        "reflection_cost_mismatch",
+        "reflection_tokens_mismatch",
+        "reflection_zero_calls_nonzero_cost",
+        "reflection_zero_calls_nonzero_tokens",
+    ],
+)
+def test_report_semantics_enforce_cost_and_token_knownness(contradiction: str):
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    cost = report["cost"]
+    optimizer = cost["optimizer"]
+    final = cost["final_revalidation"]
+    if contradiction == "candidate_calls_known":
+        optimizer["candidate_evaluation_agent_calls"] = 1
+        optimizer["model_calls"] = 1
+        cost["model_calls"] = 1
+    elif contradiction == "candidate_calls_missing_scoped_reason":
+        optimizer["candidate_evaluation_agent_calls"] = 1
+        optimizer["model_calls"] = 1
+        optimizer["estimated_cost"] = None
+        optimizer["token_usage"] = None
+        optimizer["token_usage_known"] = False
+        optimizer["unknown_token_usage_reason"] = "unknown"
+        cost.update(
+            {
+                "estimated_total": None,
+                "cost_source": "unknown",
+                "unknown_cost_reason": "unknown",
+                "model_calls": 1,
+                "token_usage": None,
+                "token_usage_known": False,
+                "unknown_token_usage_reason": "unknown",
+            }
+        )
+    elif contradiction in {
+        "candidate_calls_missing_top_cost_reason",
+        "candidate_calls_missing_top_token_reason",
+    }:
+        optimizer["candidate_evaluation_agent_calls"] = 1
+        optimizer["model_calls"] = 1
+        optimizer["estimated_cost"] = None
+        optimizer["token_usage"] = None
+        optimizer["token_usage_known"] = False
+        optimizer["unknown_token_usage_reason"] = "optimizer candidate-evaluation token usage is not exposed"
+        cost.update(
+            {
+                "estimated_total": None,
+                "cost_source": "unknown",
+                "unknown_cost_reason": (
+                    "unknown"
+                    if contradiction == "candidate_calls_missing_top_cost_reason"
+                    else "optimizer candidate-evaluation calls do not expose token or cost usage"
+                ),
+                "model_calls": 1,
+                "token_usage": None,
+                "token_usage_known": False,
+                "unknown_token_usage_reason": (
+                    "unknown"
+                    if contradiction == "candidate_calls_missing_top_token_reason"
+                    else "optimizer candidate-evaluation token usage is not exposed"
+                ),
+            }
+        )
+    elif contradiction == "optimizer_unknown_not_propagated":
+        optimizer["estimated_cost"] = None
+        optimizer["token_usage"] = None
+        optimizer["token_usage_known"] = False
+        optimizer["unknown_token_usage_reason"] = "optimizer unknown"
+    elif contradiction == "final_unknown_not_propagated":
+        final["estimated_cost"] = None
+        final["token_usage"] = None
+        final["token_usage_known"] = False
+        final["unknown_token_usage_reason"] = "final unknown"
+    elif contradiction == "top_unknown_with_known_scopes":
+        cost.update(
+            {
+                "estimated_total": None,
+                "cost_source": "unknown",
+                "unknown_cost_reason": "unknown",
+                "token_usage": None,
+                "token_usage_known": False,
+                "unknown_token_usage_reason": "unknown",
+            }
+        )
+    elif contradiction == "reflection_cost_mismatch":
+        optimizer["reflection_reported_usage"]["estimated_cost"] = 0.5
+    elif contradiction == "reflection_tokens_mismatch":
+        optimizer["reflection_reported_usage"]["token_usage"] = {
+            "prompt": 1,
+            "completion": 0,
+            "total": 1,
+        }
+    elif contradiction == "reflection_zero_calls_nonzero_cost":
+        optimizer["reflection_reported_usage"]["estimated_cost"] = 0.5
+        optimizer["estimated_cost"] = 0.5
+        cost["estimated_total"] = 0.5
+    else:
+        nonzero_tokens = {"prompt": 1, "completion": 0, "total": 1}
+        optimizer["reflection_reported_usage"]["token_usage"] = nonzero_tokens
+        optimizer["token_usage"] = copy.deepcopy(nonzero_tokens)
+        cost["token_usage"] = copy.deepcopy(nonzero_tokens)
 
     with pytest.raises(ValidationError):
         module.validate_report_schema(report)
@@ -1545,6 +1854,59 @@ def test_prompt_artifacts_reject_unsafe_candidate_path_components(
         )
 
     assert not (tmp_path.parent / "escape").exists()
+
+
+@pytest.mark.parametrize("writer", ["candidate", "optimizer_round"])
+def test_prompt_artifact_writers_reject_preexisting_prompts_symlink_escape(
+    tmp_path: Path,
+    writer: str,
+):
+    module = load_pipeline_module()
+    run_dir = tmp_path / "run"
+    outside = tmp_path / "outside"
+    run_dir.mkdir()
+    outside.mkdir()
+    try:
+        (run_dir / "prompts").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks unavailable: {error}")
+
+    with pytest.raises(ValueError, match="beneath run_dir"):
+        if writer == "candidate":
+            module.write_prompt_artifacts(
+                run_dir=run_dir,
+                candidate_id="candidate",
+                source_prompts=module.read_source_prompts(
+                    EXAMPLE_DIR / "agent" / "prompts" / "system.md",
+                    EXAMPLE_DIR / "agent" / "prompts" / "router.md",
+                ),
+                candidate_prompts={},
+                summary="containment test",
+                source_written=False,
+            )
+        else:
+            module.write_optimizer_round_artifacts(
+                run_dir=run_dir,
+                rounds=[
+                    SimpleNamespace(
+                        round=1,
+                        optimized_field_names=[],
+                        candidate_prompts={"system_prompt": "prompt"},
+                        validation_pass_rate=1.0,
+                        metric_breakdown={},
+                        accepted=False,
+                        acceptance_reason=None,
+                        skip_reason="containment test",
+                        error_message=None,
+                        failed_case_ids=[],
+                        round_llm_cost=0.0,
+                        round_token_usage={"prompt": 0, "completion": 0, "total": 0},
+                        duration_seconds=0.0,
+                    )
+                ],
+            )
+
+    assert list(outside.iterdir()) == []
 
 
 def test_router_prompt_is_instructional_not_a_gold_answer():
@@ -2185,6 +2547,41 @@ async def test_online_mode_missing_env_fails_before_api_call(tmp_path: Path, mon
 
 
 @pytest.mark.asyncio
+async def test_online_rejects_malformed_optimizer_required_metrics_before_optimizer_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("TRPC_AGENT_API_KEY", "fake-key")
+    monkeypatch.setenv("TRPC_AGENT_BASE_URL", "http://localhost/fake")
+    monkeypatch.setenv("TRPC_AGENT_MODEL_NAME", "fake-model")
+    module = load_pipeline_module()
+    payload = load_report(EXAMPLE_DIR / "optimizer.json")
+    payload["optimize"]["stop"]["required_metrics"] = "metric"
+    optimizer_config = tmp_path / "malformed_optimizer.json"
+    optimizer_config.write_text(json.dumps(payload), encoding="utf-8")
+    called = False
+
+    async def fail_if_called(**_: Any):
+        nonlocal called
+        called = True
+        raise AssertionError("optimizer must not be called")
+
+    import trpc_agent_sdk.evaluation as evaluation_pkg
+
+    monkeypatch.setattr(evaluation_pkg.AgentOptimizer, "optimize", staticmethod(fail_if_called))
+
+    with pytest.raises(ValueError, match="required_metrics"):
+        await module.run_online(
+            seed=7,
+            output_dir=tmp_path,
+            run_id="malformed_optimizer_config",
+            optimizer_config=optimizer_config,
+        )
+
+    assert called is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("raise_during_run", [False, True])
 async def test_online_call_agent_closes_runner(
     monkeypatch: pytest.MonkeyPatch,
@@ -2430,11 +2827,14 @@ async def test_online_mode_can_construct_optimizer_call_without_real_api(
     assert report["cost"]["estimated_total"] is None
     assert report["cost"]["cost_source"] == "unknown"
     assert report["cost"]["optimizer"]["model_calls"] == 5
-    assert report["cost"]["optimizer"]["token_usage"]["total"] == 10
+    assert report["cost"]["optimizer"]["native_judge_model_calls"] == 3
+    assert report["cost"]["optimizer"]["judge_model_call_source"] == "native_optimizer_counter"
+    assert report["cost"]["optimizer"]["token_usage"] is None
+    assert report["cost"]["optimizer"]["reflection_reported_usage"]["token_usage"]["total"] == 10
     assert report["cost"]["final_revalidation"]["model_calls"] > 0
     assert report["cost"]["token_usage"] is None
     assert report["cost"]["token_usage_known"] is False
-    assert report["cost"]["optimizer"]["token_usage_known"] is True
+    assert report["cost"]["optimizer"]["token_usage_known"] is False
     assert report["cost"]["final_revalidation"]["token_usage"] is None
     assert report["cost"]["final_revalidation"]["token_usage_known"] is False
     assert report["cost"]["model_calls"] == (
@@ -2980,6 +3380,7 @@ def test_online_cost_audit_distinguishes_optimizer_tokens_from_pipeline_tokens()
     audit = module.online_cost_audit(
         _optimizer_result({"prompt": 8, "completion": 2, "total": 10}),
         optimizer_candidate_agent_calls=2,
+        optimizer_llm_metric_count=0,
         final_revalidation_calls={"agent_calls": 6, "judge_model_calls": 6, "model_calls": 12},
     )
 
@@ -3009,6 +3410,7 @@ def test_online_cost_audit_rejects_noninteger_native_call_counters():
     audit = module.online_cost_audit(
         result,
         optimizer_candidate_agent_calls=0,
+        optimizer_llm_metric_count=0,
         final_revalidation_calls={"agent_calls": 0, "judge_model_calls": 0, "model_calls": 0},
     )
 
@@ -3016,6 +3418,70 @@ def test_online_cost_audit_rejects_noninteger_native_call_counters():
     assert audit["optimizer"]["usage_evidence_valid"] is False
     assert audit["optimizer"]["token_usage_known"] is False
     assert audit["optimizer"]["token_usage"] is None
+
+
+def test_online_cost_audit_reconciles_native_and_derived_optimizer_judge_calls():
+    module = load_pipeline_module()
+    result = _optimizer_result({"prompt": 8, "completion": 2, "total": 10})
+    result.total_judge_model_calls = 3
+
+    audit = module.online_cost_audit(
+        result,
+        optimizer_candidate_agent_calls=2,
+        optimizer_llm_metric_count=1,
+        final_revalidation_calls={"agent_calls": 0, "judge_model_calls": 0, "model_calls": 0},
+    )
+    optimizer = audit["optimizer"]
+
+    assert optimizer["native_judge_model_calls"] == 3
+    assert optimizer["derived_judge_model_calls"] == 2
+    assert optimizer["judge_model_calls"] == 3
+    assert optimizer["judge_model_call_source"] == "reconciled_native_and_derived_max"
+    assert optimizer["model_calls"] == 6
+    assert audit["model_calls"] == 6
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("include_llm_metric", "expected_judge_calls", "expected_optimizer_calls", "expected_source"),
+    [
+        (False, 0, 3, "none"),
+        (True, 2, 5, "derived_from_candidate_calls_and_llm_metrics"),
+    ],
+)
+async def test_run_online_accounts_for_optimizer_internal_llm_metric_judges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    include_llm_metric: bool,
+    expected_judge_calls: int,
+    expected_optimizer_calls: int,
+    expected_source: str,
+):
+    module = load_pipeline_module()
+    metrics = load_report(EXAMPLE_DIR / "optimizer.json")["evaluate"]["metrics"]
+    optimizer_config = _write_optimizer_config(
+        tmp_path,
+        metrics=metrics if include_llm_metric else metrics[:1],
+    )
+    report = await _run_stubbed_online(
+        module=module,
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        result=_optimizer_result({"prompt": 8, "completion": 2, "total": 10}),
+        run_id=f"optimizer_judges_{include_llm_metric}",
+        optimizer_agent_calls=2,
+        optimizer_config=optimizer_config,
+    )
+    optimizer = report["cost"]["optimizer"]
+
+    assert optimizer["derived_judge_model_calls"] == expected_judge_calls
+    assert optimizer["judge_model_calls"] == expected_judge_calls
+    assert optimizer["judge_model_call_source"] == expected_source
+    assert optimizer["model_calls"] == expected_optimizer_calls
+    assert report["cost"]["model_calls"] == (
+        expected_optimizer_calls + report["cost"]["final_revalidation"]["model_calls"]
+    )
+    module.validate_report_schema(report)
 
 
 @pytest.mark.asyncio
@@ -3036,7 +3502,8 @@ async def test_online_optimizer_candidate_agent_calls_are_instrumented(
 
     optimizer = report["cost"]["optimizer"]
     assert optimizer["candidate_evaluation_agent_calls"] == 2
-    assert optimizer["model_calls"] == 3
+    assert optimizer["derived_judge_model_calls"] == 2
+    assert optimizer["model_calls"] == 5
     assert optimizer["token_usage_known"] is False
     assert report["cost"]["model_calls"] == (
         optimizer["model_calls"] + report["cost"]["final_revalidation"]["model_calls"]

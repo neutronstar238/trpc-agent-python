@@ -60,10 +60,13 @@ In online mode, the duration gate uses elapsed pipeline time through
 optimization, baseline revalidation, and candidate revalidation. The separate
 `online_duration` fields retain those phase durations, while each candidate's
 audit retains its own revalidation duration. Optimizer `model_calls` includes
-candidate-evaluation agent calls, reflection calls, and judge calls. Because
+candidate-evaluation agent calls, reflection calls, and judge calls. Optimizer
+judge calls are derived from counted candidate evaluations and validated LLM
+metrics; a nonzero native counter is reconciled with the derived count without
+double counting, and `judge_model_call_source` records the source. Because
 `AgentOptimizer` does not expose token or cost usage for candidate-evaluation
-calls, optimizer phase totals are `null` and marked unknown whenever those calls
-occur. `optimizer.reflection_reported_usage` preserves the native
+or judge calls, optimizer phase totals are `null` and marked unknown whenever
+those calls occur. `optimizer.reflection_reported_usage` preserves the native
 reflection-only cost and token counters under an explicit scope. Final
 revalidation token usage is likewise `null` when `AgentEvaluator` cannot expose
 it. Top-level `model_calls` is the optimizer phase plus final revalidation.
@@ -103,9 +106,11 @@ a harmless explanation rewrite does not zero out an otherwise correct route.
 version when installed, model name, redacted base URL host, seed, command, and
 optimizer config path. It never records API keys. Provider/runtime warnings are
 not globally suppressed: an expected DeepSeek response-schema downgrade remains
-observable as a provider compatibility warning. SSE decoder shutdown or resource
-cleanup warnings are cleanup defects, not expected provider warnings, and should
-be investigated rather than filtered out.
+observable as a provider compatibility warning.
+The pipeline awaits `Runner.close()` on its own execution paths. Even so,
+upstream OpenAI/httpx may still emit Python 3.13 stream-shutdown diagnostics.
+Those warnings remain observable rather than being suppressed or automatically
+attributed to this example.
 
 Report error text redacts provider URLs, configured provider credentials,
 standalone provider-key shapes, and semantic credential markers while retaining

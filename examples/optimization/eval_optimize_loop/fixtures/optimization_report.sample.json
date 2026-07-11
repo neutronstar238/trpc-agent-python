@@ -2616,6 +2616,9 @@
       "candidate_evaluation_agent_calls": 0,
       "reflection_lm_calls": 0,
       "judge_model_calls": 0,
+      "native_judge_model_calls": 0,
+      "derived_judge_model_calls": 0,
+      "judge_model_call_source": "none",
       "token_usage": {
         "prompt": 0,
         "completion": 0,

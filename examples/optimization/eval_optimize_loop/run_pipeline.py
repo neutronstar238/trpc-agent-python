@@ -31,6 +31,7 @@ import uuid
 from collections import Counter
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -151,16 +152,47 @@ def validate_report_schema(report: dict[str, Any]) -> None:
     if baseline["validation"] != baseline["final_validation"]:
         reject("baseline validation must equal final_validation")
 
+    def reject_duplicate_cases(summary: dict[str, Any], label: str) -> None:
+        case_ids = [case["case_id"] for case in summary["case_results"]]
+        duplicates = sorted(case_id for case_id, count in Counter(case_ids).items() if count > 1)
+        if duplicates:
+            reject(f"{label} contains duplicate case_id values: {', '.join(duplicates)}")
+
+    for summary_name in ("train", "optimizer_dev", "validation", "final_validation"):
+        reject_duplicate_cases(baseline[summary_name], f"baseline.{summary_name}")
+
     candidates_by_id: dict[str, dict[str, Any]] = {}
     accepted_candidates: list[dict[str, Any]] = []
     for candidate in report["candidates"]:
         candidate_id = candidate["id"]
+        if candidate_id in candidates_by_id:
+            reject(f"report contains duplicate candidate id: {candidate_id}")
         if _is_windows_reserved_name(candidate_id):
             reject("candidate id uses a Windows reserved device basename")
         if candidate["gate"]["candidate_id"] != candidate_id:
             reject("candidate gate candidate_id must equal candidate id")
         if candidate["validation"] != candidate["final_validation"]:
             reject("candidate validation must equal final_validation")
+        for summary_name in ("train", "optimizer_dev", "validation", "final_validation"):
+            reject_duplicate_cases(candidate[summary_name], f"candidate {candidate_id}.{summary_name}")
+        expected_delta = {
+            "train_score": _score_delta(candidate["train"]["score"], baseline["train"]["score"]),
+            "optimizer_dev_score": _score_delta(
+                candidate["optimizer_dev"]["score"],
+                baseline["optimizer_dev"]["score"],
+            ),
+            "validation_score": _score_delta(
+                candidate["validation"]["score"],
+                baseline["validation"]["score"],
+            ),
+        }
+        if candidate["delta"] != expected_delta:
+            reject(f"candidate delta does not match recomputed six-decimal deltas: {candidate_id}")
+        if candidate["gate"]["validation_delta"] != expected_delta["validation_score"]:
+            reject(f"candidate gate validation_delta does not match candidate delta: {candidate_id}")
+        expected_case_deltas = build_case_deltas(baseline["validation"], candidate["validation"])
+        if candidate["case_deltas"] != expected_case_deltas:
+            reject(f"candidate case_deltas do not match recomputed validation case deltas: {candidate_id}")
         if candidate["gate"]["accepted"]:
             if candidate["gate"]["validation_delta"] <= 0:
                 reject("accepted candidate validation delta must be strictly positive")
@@ -187,6 +219,25 @@ def validate_report_schema(report: dict[str, Any]) -> None:
 
     cost = report["cost"]
     optimizer_cost = cost["optimizer"]
+    native_judge_calls = optimizer_cost["native_judge_model_calls"]
+    derived_judge_calls = optimizer_cost["derived_judge_model_calls"]
+    expected_judge_calls = max(native_judge_calls, derived_judge_calls)
+    if optimizer_cost["judge_model_calls"] != expected_judge_calls:
+        reject("optimizer judge_model_calls must reconcile native and derived counts without double counting")
+    if native_judge_calls and derived_judge_calls:
+        expected_judge_source = (
+            "native_and_derived_agree"
+            if native_judge_calls == derived_judge_calls
+            else "reconciled_native_and_derived_max"
+        )
+    elif native_judge_calls:
+        expected_judge_source = "native_optimizer_counter"
+    elif derived_judge_calls:
+        expected_judge_source = "derived_from_candidate_calls_and_llm_metrics"
+    else:
+        expected_judge_source = "none"
+    if optimizer_cost["judge_model_call_source"] != expected_judge_source:
+        reject("optimizer judge_model_call_source does not match reconciled judge evidence")
     expected_optimizer_calls = (
         optimizer_cost["candidate_evaluation_agent_calls"]
         + optimizer_cost["reflection_lm_calls"]
@@ -200,6 +251,89 @@ def validate_report_schema(report: dict[str, Any]) -> None:
     expected_model_calls = cost["optimizer"]["model_calls"] + cost["final_revalidation"]["model_calls"]
     if cost["model_calls"] != expected_model_calls:
         reject("top-level model_calls must equal optimizer plus final revalidation calls")
+
+    reflection_usage = optimizer_cost["reflection_reported_usage"]
+    if reflection_usage["token_usage_known"]:
+        if reflection_usage["unknown_token_usage_reason"] is not None:
+            reject("known optimizer reflection token usage must not carry an unknown reason")
+    elif not reflection_usage["unknown_token_usage_reason"]:
+        reject("unknown optimizer reflection token usage must carry a reason")
+    for scope, label in (
+        (optimizer_cost, "optimizer"),
+        (final_cost, "final revalidation"),
+        (cost, "top-level"),
+    ):
+        if scope["token_usage_known"]:
+            if scope["token_usage"] is None or scope["unknown_token_usage_reason"] is not None:
+                reject(f"{label} known token usage must provide counters without an unknown reason")
+        elif scope["token_usage"] is not None or not scope["unknown_token_usage_reason"]:
+            reject(f"{label} unknown token usage must be null with a reason")
+
+    unknown_optimizer_calls = (
+        optimizer_cost["candidate_evaluation_agent_calls"] > 0 or optimizer_cost["judge_model_calls"] > 0
+    )
+    if unknown_optimizer_calls or not optimizer_cost["usage_evidence_valid"]:
+        if (
+            optimizer_cost["estimated_cost"] is not None
+            or optimizer_cost["token_usage"] is not None
+            or optimizer_cost["token_usage_known"]
+        ):
+            reject("optimizer calls with unscoped usage must force unknown phase cost and tokens")
+    else:
+        if optimizer_cost["estimated_cost"] != reflection_usage["estimated_cost"]:
+            reject("optimizer phase cost must match scoped reflection cost when fully known")
+        if optimizer_cost["token_usage"] != reflection_usage["token_usage"]:
+            reject("optimizer phase tokens must match scoped reflection tokens when fully known")
+    if optimizer_cost["usage_evidence_valid"] and (
+        reflection_usage["estimated_cost"] is None or not reflection_usage["token_usage_known"]
+    ):
+        reject("valid optimizer usage evidence requires known scoped reflection usage")
+    if (
+        optimizer_cost["usage_evidence_valid"]
+        and optimizer_cost["reflection_lm_calls"] == 0
+        and (reflection_usage["estimated_cost"] != 0 or reflection_usage["token_usage"]["total"] != 0)
+    ):
+        reject("zero reflection calls require zero scoped reflection cost and tokens")
+    if optimizer_cost["candidate_evaluation_agent_calls"] > 0 and "candidate-evaluation" not in (
+        optimizer_cost["unknown_token_usage_reason"] or ""
+    ):
+        reject("optimizer candidate-evaluation unknown token reason must name that scope")
+    if optimizer_cost["candidate_evaluation_agent_calls"] > 0 and (
+        "candidate-evaluation" not in (cost["unknown_cost_reason"] or "")
+        or "candidate-evaluation" not in (cost["unknown_token_usage_reason"] or "")
+    ):
+        reject("top-level unknown usage reasons must preserve candidate-evaluation scope")
+    if optimizer_cost["judge_model_calls"] > 0 and "judge" not in (optimizer_cost["unknown_token_usage_reason"] or ""):
+        reject("optimizer judge unknown token reason must name that scope")
+    if optimizer_cost["judge_model_calls"] > 0 and (
+        "judge" not in (cost["unknown_cost_reason"] or "") or "judge" not in (cost["unknown_token_usage_reason"] or "")
+    ):
+        reject("top-level unknown usage reasons must preserve optimizer judge scope")
+
+    if final_cost["model_calls"] == 0:
+        if final_cost["estimated_cost"] != 0 or not final_cost["token_usage_known"]:
+            reject("zero-call final revalidation must have known zero cost and tokens")
+    elif final_cost["estimated_cost"] is not None or final_cost["token_usage_known"]:
+        reject("final revalidation calls without usage counters must remain unknown")
+
+    scoped_costs_known = optimizer_cost["estimated_cost"] is not None and final_cost["estimated_cost"] is not None
+    if scoped_costs_known:
+        if cost["estimated_total"] != optimizer_cost["estimated_cost"] + final_cost["estimated_cost"]:
+            reject("top-level estimated cost must equal known scoped costs")
+        if cost["cost_source"] == "unknown" or cost["unknown_cost_reason"] is not None:
+            reject("known top-level cost must not carry unknown cost evidence")
+    elif cost["estimated_total"] is not None or cost["cost_source"] != "unknown" or not cost["unknown_cost_reason"]:
+        reject("unknown scoped cost must propagate to top-level cost fields")
+
+    scoped_tokens_known = optimizer_cost["token_usage_known"] and final_cost["token_usage_known"]
+    if scoped_tokens_known:
+        expected_token_usage = {
+            key: optimizer_cost["token_usage"][key] + final_cost["token_usage"][key] for key in TOKEN_USAGE_KEYS
+        }
+        if not cost["token_usage_known"] or cost["token_usage"] != expected_token_usage:
+            reject("top-level token usage must equal known scoped token usage")
+    elif cost["token_usage_known"] or cost["token_usage"] is not None or not cost["unknown_token_usage_reason"]:
+        reject("unknown scoped token usage must propagate to top-level token fields")
 
     def validate_token_totals(value: Any) -> None:
         if isinstance(value, dict):
@@ -359,7 +493,13 @@ def write_optimizer_round_artifacts(
             round_id = next_fallback_round_id
             next_fallback_round_id += 1
         used_round_ids.add(round_id)
-        round_dir = run_dir / "prompts" / f"optimizer_round_{round_id:03d}"
+        round_component = f"optimizer_round_{round_id:03d}"
+        round_dir = _resolved_run_descendant(
+            run_dir,
+            "prompts",
+            round_component,
+            label="optimizer round prompt directory",
+        )
         round_dir.mkdir(parents=True, exist_ok=True)
         prompt_paths: dict[str, str] = {}
         prompt_hashes: dict[str, str] = {}
@@ -396,7 +536,13 @@ def write_optimizer_round_artifacts(
                 invalid_prompt_evidence = True
                 if "prompt content was normalized to an empty string" not in prompt_reasons:
                     prompt_reasons.append("prompt content was normalized to an empty string")
-            prompt_path = round_dir / f"{name}.md"
+            prompt_path = _resolved_run_descendant(
+                run_dir,
+                "prompts",
+                round_component,
+                f"{name}.md",
+                label="optimizer round prompt artifact",
+            )
             prompt_path.write_text(content, encoding="utf-8")
             prompt_paths[name] = str(prompt_path)
             prompt_hashes[name] = sha256_text(content)
@@ -557,28 +703,57 @@ def resolve_path(path: Path | None, default: Path) -> Path:
 
 
 def optimizer_metric_names(config_path: Path) -> list[str]:
-    evaluate = load_json(config_path).get("evaluate") or {}
-    metrics = evaluate.get("metrics") or []
-    names = []
-    for metric in metrics:
+    payload = load_json(config_path)
+    evaluate = payload.get("evaluate") if isinstance(payload, dict) else None
+    metrics = evaluate.get("metrics") if isinstance(evaluate, dict) else None
+    if not isinstance(metrics, list):
+        raise ValueError("optimizer evaluate.metrics must be an array")
+    names: list[str] = []
+    for position, metric in enumerate(metrics):
         if not isinstance(metric, dict):
-            continue
+            raise ValueError(f"optimizer evaluate.metrics[{position}] must be an object")
         name = metric.get("metric_name") or metric.get("metricName")
-        if name:
-            names.append(str(name))
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"optimizer evaluate.metrics[{position}].metric_name must be a non-empty string")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise ValueError("optimizer evaluate.metrics metric_name values must be unique")
     return names
 
 
 def optimizer_required_metrics(config_path: Path) -> tuple[list[str], str]:
     payload = load_json(config_path)
-    required = ((payload.get("optimize") or {}).get("stop") or {}).get("required_metrics")
+    optimize = payload.get("optimize") if isinstance(payload, dict) else None
+    stop = optimize.get("stop") if isinstance(optimize, dict) else None
+    if not isinstance(stop, dict):
+        raise ValueError("optimizer optimize.stop must be an object")
+    required = stop.get("required_metrics")
     if required is None:
         return [], "optimizer_config"
     if required == "all":
         return optimizer_metric_names(config_path), "optimizer_config"
-    if isinstance(required, str):
-        return [required], "optimizer_config"
-    return [str(name) for name in required], "optimizer_config"
+    if not isinstance(required, list):
+        raise ValueError("optimizer required_metrics must be 'all', null, or an array of strings")
+    if any(not isinstance(name, str) or not name.strip() for name in required):
+        raise ValueError("optimizer required_metrics must contain only non-empty strings")
+    if len(set(required)) != len(required):
+        raise ValueError("optimizer required_metrics must contain unique strings")
+    unknown = sorted(set(required) - set(optimizer_metric_names(config_path)))
+    if unknown:
+        raise ValueError("optimizer required_metrics references unknown metrics: " + ", ".join(unknown))
+    return required, "optimizer_config"
+
+
+def validated_optimizer_evaluate_config(config_path: Path) -> dict[str, Any]:
+    from trpc_agent_sdk.evaluation import load_optimize_config
+
+    try:
+        load_optimize_config(str(config_path))
+        optimizer_required_metrics(config_path)
+    except Exception as error:
+        raise ValueError(f"invalid optimizer config: {error}") from error
+    payload = load_json(config_path)
+    return payload["evaluate"]
 
 
 def online_preflight() -> dict[str, bool]:
@@ -697,8 +872,6 @@ def load_gate_config(
         config["required_metrics"] = optimizer_metric_names(optimizer_config)
     if config.get("required_metrics") is None:
         config["required_metrics"] = []
-    if isinstance(config.get("required_metrics"), str) and config["required_metrics"] != "all":
-        config["required_metrics"] = [config["required_metrics"]]
     config["required_metrics_source"] = required_source
     return config
 
@@ -730,6 +903,8 @@ def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalse
             raise ValueError(f"{role} evalset must be valid UTF-8 JSON: {error}") from error
         if not isinstance(payload, dict) or not isinstance(payload.get("eval_cases"), list):
             raise ValueError(f"{role} evalset must be an object with an eval_cases array")
+        if not payload["eval_cases"]:
+            raise ValueError(f"{role} evalset eval_cases must not be empty")
         role_evidence = {"id": set(), "input": set(), "gold": set()}
         for position, case in enumerate(payload["eval_cases"]):
             prefix = f"{role} evalset eval_cases[{position}]"
@@ -739,6 +914,8 @@ def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalse
             conversation = case.get("conversation")
             if not isinstance(case_id, str) or not case_id.strip():
                 raise ValueError(f"{prefix}.eval_id must be a non-empty string")
+            if case_id in role_evidence["id"]:
+                raise ValueError(f"{role} evalset contains duplicate eval_id: {case_id}")
             if not isinstance(conversation, list) or not conversation or not isinstance(conversation[0], dict):
                 raise ValueError(f"{prefix}.conversation must be a non-empty array of objects")
             invocation = conversation[0]
@@ -759,13 +936,11 @@ def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalse
             ):
                 raise ValueError(f"{prefix} final_response.parts must contain text strings")
             normalized_input = " ".join("".join(part["text"] for part in user_parts).split()).casefold()
-            exact_gold = json.dumps(
-                [part["text"] for part in gold_parts],
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            exact_gold = final_text_from_content(final_response)
             if not normalized_input:
                 raise ValueError(f"{prefix} normalized user input must be non-empty")
+            if not exact_gold:
+                raise ValueError(f"{prefix} visible final response must be non-empty")
             role_evidence["id"].add(case_id)
             role_evidence["input"].add(normalized_input)
             role_evidence["gold"].add(exact_gold)
@@ -798,6 +973,14 @@ def _resolved_artifact_child(parent: Path, component: str, *, label: str) -> Pat
     if not resolved_child.is_relative_to(resolved_parent):
         raise ValueError(f"resolved {label} artifact path must stay beneath its parent")
     return resolved_child
+
+
+def _resolved_run_descendant(run_dir: Path, *components: str, label: str) -> Path:
+    resolved_run_dir = run_dir.resolve()
+    resolved_descendant = run_dir.joinpath(*components).resolve()
+    if not resolved_descendant.is_relative_to(resolved_run_dir):
+        raise ValueError(f"resolved {label} must remain beneath run_dir")
+    return resolved_descendant
 
 
 def make_run_dir(output_dir: Path | None, run_id: str) -> Path:
@@ -866,13 +1049,25 @@ def write_prompt_artifacts(
     summary: str,
     source_written: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    prompt_dir = _resolved_artifact_child(run_dir / "prompts", candidate_id, label="candidate_id")
+    safe_candidate_id = _validate_safe_path_component(candidate_id, label="candidate_id")
+    prompt_dir = _resolved_run_descendant(
+        run_dir,
+        "prompts",
+        safe_candidate_id,
+        label="candidate prompt directory",
+    )
     prompt_dir.mkdir(parents=True, exist_ok=True)
     audit: list[dict[str, Any]] = []
     patch_lines = [f"candidate: {candidate_id}", f"summary: {summary}", ""]
     for name, (source_path, source_text) in source_prompts.items():
         candidate_text = candidate_prompts.get(name, source_text)
-        candidate_path = prompt_dir / f"{name}.md"
+        candidate_path = _resolved_run_descendant(
+            run_dir,
+            "prompts",
+            safe_candidate_id,
+            f"{name}.md",
+            label="candidate prompt artifact",
+        )
         candidate_path.write_text(candidate_text, encoding="utf-8")
         diff_text = prompt_diff(source_text, candidate_text, name)
         patch_lines.extend([f"## {name}", diff_text, ""])
@@ -887,7 +1082,13 @@ def write_prompt_artifacts(
                 "diff": diff_text,
             }
         )
-    patch_path = prompt_dir / "prompt_patch.diff"
+    patch_path = _resolved_run_descendant(
+        run_dir,
+        "prompts",
+        safe_candidate_id,
+        "prompt_patch.diff",
+        label="candidate prompt patch",
+    )
     patch_path.write_text("\n".join(patch_lines), encoding="utf-8")
     return audit, {
         "prompt_dir": str(prompt_dir),
@@ -1563,25 +1764,41 @@ def _normalize_required_metrics(value: Any, candidate_metrics: dict[str, Any]) -
 def apply_gate(
     *,
     candidate_id: str,
-    baseline_val: dict[str, Any],
-    candidate_val: dict[str, Any],
-    gate_config: dict[str, Any],
+    baseline_val: Any,
+    candidate_val: Any,
+    gate_config: Any,
     duration_seconds: float,
     cost_usd: float | None,
 ) -> dict[str, Any]:
-    baseline_by_id, baseline_issues = _index_gate_cases(baseline_val)
-    candidate_by_id, candidate_issues = _index_gate_cases(candidate_val)
     reasons: list[str] = []
+    if isinstance(baseline_val, Mapping):
+        normalized_baseline = dict(baseline_val)
+    else:
+        normalized_baseline = {}
+        reasons.append("baseline_val must be a mapping")
+    if isinstance(candidate_val, Mapping):
+        normalized_candidate = dict(candidate_val)
+    else:
+        normalized_candidate = {}
+        reasons.append("candidate_val must be a mapping")
+    if isinstance(gate_config, Mapping):
+        normalized_gate_config = dict(gate_config)
+    else:
+        normalized_gate_config = {}
+        reasons.append("gate_config must be a mapping")
+
+    baseline_by_id, baseline_issues = _index_gate_cases(normalized_baseline)
+    candidate_by_id, candidate_issues = _index_gate_cases(normalized_candidate)
     reasons.extend(baseline_issues)
     reasons.extend(candidate_issues)
     accepted = not reasons
 
-    allow_new_hard_fails = gate_config.get("allow_new_hard_fails", False)
+    allow_new_hard_fails = normalized_gate_config.get("allow_new_hard_fails", False)
     if not isinstance(allow_new_hard_fails, bool):
         allow_new_hard_fails = False
         accepted = False
         reasons.append("allow_new_hard_fails must be a boolean and was treated as false")
-    allow_critical_regression = gate_config.get("allow_critical_regression", False)
+    allow_critical_regression = normalized_gate_config.get("allow_critical_regression", False)
     if not isinstance(allow_critical_regression, bool):
         allow_critical_regression = False
         accepted = False
@@ -1600,8 +1817,8 @@ def apply_gate(
                 accepted = False
                 reasons.append(f"{label} case {case_id} tags must be an array")
 
-    baseline_score = _finite_float(baseline_val.get("score"))
-    candidate_score = _finite_float(candidate_val.get("score"))
+    baseline_score = _finite_float(normalized_baseline.get("score"))
+    candidate_score = _finite_float(normalized_candidate.get("score"))
     raw_validation_delta = (
         None if baseline_score is None or candidate_score is None else candidate_score - baseline_score
     )
@@ -1617,7 +1834,7 @@ def apply_gate(
     if validation_delta is None:
         accepted = False
         reasons.append("baseline and candidate validation scores must be finite numbers")
-    min_delta = _finite_float(gate_config.get("min_validation_delta", 0.0))
+    min_delta = _finite_float(normalized_gate_config.get("min_validation_delta", 0.0))
     if min_delta is None or min_delta < 0:
         accepted = False
         reasons.append("minimum validation delta must be a finite non-negative number")
@@ -1677,7 +1894,7 @@ def apply_gate(
         accepted = False
         reasons.append("run cost must be a finite non-negative number")
 
-    max_cost = gate_config.get("max_cost_usd")
+    max_cost = normalized_gate_config.get("max_cost_usd")
     normalized_max_cost = None if max_cost is None else _finite_float(max_cost)
     if max_cost is not None and (normalized_max_cost is None or normalized_max_cost < 0):
         normalized_max_cost = None
@@ -1690,7 +1907,7 @@ def apply_gate(
         accepted = False
         reasons.append(f"run exceeded cost budget: {normalized_cost:.4f} > {normalized_max_cost:.4f} USD")
 
-    max_seconds = gate_config.get("max_duration_seconds")
+    max_seconds = normalized_gate_config.get("max_duration_seconds")
     normalized_duration = _finite_float(duration_seconds)
     normalized_max_seconds = None if max_seconds is None else _finite_float(max_seconds)
     if normalized_duration is None or normalized_duration < 0:
@@ -1705,13 +1922,13 @@ def apply_gate(
         accepted = False
         reasons.append(f"run exceeded duration budget: {normalized_duration:.2f}s > {normalized_max_seconds:.2f}s")
 
-    candidate_metrics = candidate_val.get("metrics")
+    candidate_metrics = normalized_candidate.get("metrics")
     if not isinstance(candidate_metrics, dict):
         candidate_metrics = {}
         accepted = False
         reasons.append("candidate metrics must be an object")
     required, required_issue = _normalize_required_metrics(
-        gate_config.get("required_metrics", []),
+        normalized_gate_config.get("required_metrics", []),
         candidate_metrics,
     )
     if required_issue:
@@ -2177,6 +2394,9 @@ async def build_offline_report(
                 "candidate_evaluation_agent_calls": 0,
                 "reflection_lm_calls": 0,
                 "judge_model_calls": 0,
+                "native_judge_model_calls": 0,
+                "derived_judge_model_calls": 0,
+                "judge_model_call_source": "none",
                 "token_usage": {
                     "prompt": 0,
                     "completion": 0,
@@ -2371,11 +2591,27 @@ def online_cost_audit(
     result: Any,
     *,
     optimizer_candidate_agent_calls: int,
+    optimizer_llm_metric_count: int,
     final_revalidation_calls: dict[str, int],
 ) -> dict[str, Any]:
     reflection_calls, invalid_reflection_calls = _count_attr(result, "total_reflection_lm_calls")
-    judge_calls, invalid_judge_calls = _count_attr(result, "total_judge_model_calls")
+    native_judge_calls, invalid_judge_calls = _count_attr(result, "total_judge_model_calls")
     candidate_calls, invalid_candidate_calls = _normalized_round_count(optimizer_candidate_agent_calls)
+    llm_metric_count, invalid_llm_metric_count = _normalized_round_count(optimizer_llm_metric_count)
+    derived_judge_calls = candidate_calls * llm_metric_count
+    judge_calls = max(native_judge_calls, derived_judge_calls)
+    if native_judge_calls and derived_judge_calls:
+        judge_call_source = (
+            "native_and_derived_agree"
+            if native_judge_calls == derived_judge_calls
+            else "reconciled_native_and_derived_max"
+        )
+    elif native_judge_calls:
+        judge_call_source = "native_optimizer_counter"
+    elif derived_judge_calls:
+        judge_call_source = "derived_from_candidate_calls_and_llm_metrics"
+    else:
+        judge_call_source = "none"
     optimizer_calls = candidate_calls + reflection_calls + judge_calls
     token_usage, invalid_token_usage = _normalized_token_usage(getattr(result, "total_token_usage", {}))
     raw_cost = getattr(result, "total_llm_cost", None)
@@ -2388,10 +2624,11 @@ def online_cost_audit(
         invalid_reflection_calls
         or invalid_judge_calls
         or invalid_candidate_calls
+        or invalid_llm_metric_count
         or invalid_token_usage
         or invalid_cost
     )
-    phase_usage_known = not malformed_native_usage and candidate_calls == 0
+    phase_usage_known = not malformed_native_usage and candidate_calls == 0 and judge_calls == 0
     optimizer_cost = reflection_cost if phase_usage_known else None
     optimizer_token_usage = token_usage if phase_usage_known else None
 
@@ -2399,6 +2636,8 @@ def online_cost_audit(
     unknown_reasons: list[str] = []
     if candidate_calls > 0:
         unknown_reasons.append("optimizer candidate-evaluation calls do not expose token or cost usage")
+    if judge_calls > 0:
+        unknown_reasons.append("optimizer judge calls do not expose token or cost usage")
     if malformed_native_usage:
         unknown_reasons.append("optimizer native usage counters were malformed and normalized fail-closed")
     if final_revalidation_calls["model_calls"] > 0:
@@ -2409,11 +2648,14 @@ def online_cost_audit(
     final_token_usage = {name: 0 for name in TOKEN_USAGE_KEYS} if final_tokens_known else None
     pipeline_tokens_known = phase_usage_known and final_tokens_known
     pipeline_token_usage = optimizer_token_usage if pipeline_tokens_known else None
-    token_unknown_reasons = []
+    optimizer_token_unknown_reasons = []
     if candidate_calls > 0:
-        token_unknown_reasons.append("optimizer candidate-evaluation token usage is not exposed")
+        optimizer_token_unknown_reasons.append("optimizer candidate-evaluation token usage is not exposed")
+    if judge_calls > 0:
+        optimizer_token_unknown_reasons.append("optimizer judge token usage is not exposed")
     if malformed_native_usage:
-        token_unknown_reasons.append("optimizer native usage counters were malformed")
+        optimizer_token_unknown_reasons.append("optimizer native usage counters were malformed")
+    token_unknown_reasons = list(optimizer_token_unknown_reasons)
     if not final_tokens_known:
         token_unknown_reasons.append("AgentEvaluator does not expose final revalidation token usage")
 
@@ -2432,9 +2674,12 @@ def online_cost_audit(
             "candidate_evaluation_agent_calls": candidate_calls,
             "reflection_lm_calls": reflection_calls,
             "judge_model_calls": judge_calls,
+            "native_judge_model_calls": native_judge_calls,
+            "derived_judge_model_calls": derived_judge_calls,
+            "judge_model_call_source": judge_call_source,
             "token_usage": optimizer_token_usage,
             "token_usage_known": phase_usage_known,
-            "unknown_token_usage_reason": (None if phase_usage_known else "; ".join(token_unknown_reasons[:2])),
+            "unknown_token_usage_reason": (None if phase_usage_known else "; ".join(optimizer_token_unknown_reasons)),
             "usage_evidence_valid": not malformed_native_usage,
             "reflection_reported_usage": {
                 "estimated_cost": reflection_cost,
@@ -2446,7 +2691,7 @@ def online_cost_audit(
             },
         },
         "final_revalidation": {
-            "estimated_cost": None,
+            "estimated_cost": 0.0 if final_revalidation_calls["model_calls"] == 0 else None,
             **final_revalidation_calls,
             "token_usage": final_token_usage,
             "token_usage_known": final_tokens_known,
@@ -2541,6 +2786,10 @@ async def run_online(
     system_path = resolve_path(system_prompt, SYSTEM_PROMPT_PATH)
     router_path = resolve_path(router_prompt, ROUTER_PROMPT_PATH)
     validate_inputs(train_path, optimizer_dev_path, val_path)
+    optimizer_evaluate_config = validated_optimizer_evaluate_config(optimizer_path)
+    optimizer_llm_metric_count = sum(
+        1 for metric in optimizer_evaluate_config["metrics"] if isinstance(metric, dict) and _is_llm_metric(metric)
+    )
     gate = load_gate_config(gate_config_path, gate_config, optimizer_config=optimizer_path)
     source_prompts = read_source_prompts(system_path, router_path)
 
@@ -2631,6 +2880,7 @@ async def run_online(
     cost = online_cost_audit(
         result,
         optimizer_candidate_agent_calls=optimizer_candidate_agent_calls,
+        optimizer_llm_metric_count=optimizer_llm_metric_count,
         final_revalidation_calls=final_revalidation_call_audit(
             [
                 baseline_train,
