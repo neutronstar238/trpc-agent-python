@@ -134,9 +134,12 @@ stores a normalized, credential-free evaluation configuration and its hash;
 report validation derives optimizer and final judge-call multipliers from that
 snapshot rather than trusting the reported counters. Evaluation-metric and
 evalset manifests bind that snapshot to file hashes, case counts, and
-conversation-turn counts. Prompt artifacts and optimizer rounds embed prompt
-content so every reported SHA-256 remains independently recomputable even when
-the original run directory is unavailable.
+conversation-turn counts. A prompt-target manifest binds the registered target
+names to source paths and SHA-256 values. Validation authenticates those source
+files, recomputes every candidate diff from embedded baseline content, and
+rejects unknown optimizer targets. Prompt artifacts and optimizer rounds embed
+content so their reported SHA-256 values remain independently recomputable even
+when the original run directory is unavailable.
 
 `optimizer_dev.evalset.json` is the optimizer-internal holdout passed to
 `AgentOptimizer.optimize(..., validation_dataset_path=...)`. `val.evalset.json`

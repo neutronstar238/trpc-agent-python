@@ -1882,6 +1882,18 @@ def test_sample_prompt_artifact_hashes_are_self_contained():
         assert artifact["sha256"] == module.sha256_text(artifact["content"])
 
 
+def test_sample_report_records_prompt_target_manifest():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    targets = report["config_snapshot"]["prompt_targets"]
+    baseline_by_name = {artifact["name"]: artifact for artifact in report["baseline"]["prompt_artifacts"]}
+
+    assert set(targets) == {"system_prompt", "router_prompt"}
+    for name, target in targets.items():
+        assert target["source_path"] == report["config_snapshot"]["paths"][name]
+        assert target["sha256"] == module.sha256_text(baseline_by_name[name]["content"])
+
+
 def test_report_semantics_reconcile_candidate_audit_cost_with_pipeline_cost():
     module = load_pipeline_module()
     report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
@@ -1909,6 +1921,10 @@ def test_report_semantics_reconcile_candidate_audit_cost_with_pipeline_cost():
         "missing_evalsets_coordinated",
         "candidate_prompt_artifacts_empty",
         "accepted_round_prompt_evidence_empty",
+        "coordinated_prompt_target_rename",
+        "coordinated_missing_prompt_sources_with_forged_diffs",
+        "coordinated_missing_prompt_sources_with_valid_diffs",
+        "accepted_round_unknown_prompt_target",
     ],
 )
 def test_report_semantics_bind_reproducibility_audit_fields(mutation: str):
@@ -1996,13 +2012,56 @@ def test_report_semantics_bind_reproducibility_audit_fields(mutation: str):
     elif mutation == "candidate_prompt_artifacts_empty":
         for candidate in report["candidates"]:
             candidate["prompt_artifacts"] = []
-    else:
+    elif mutation == "accepted_round_prompt_evidence_empty":
         round_record.update(
             {
                 "optimized_field_names": ["system_prompt"],
                 "prompt_paths": {},
                 "prompt_sha256": {},
                 "prompt_contents": {},
+                "accepted": True,
+            }
+        )
+        report["optimization_rounds"] = [round_record]
+    elif mutation == "coordinated_prompt_target_rename":
+        renamed = {"system_prompt": "alpha", "router_prompt": "beta"}
+        report["config_snapshot"]["prompt_targets"] = {
+            renamed[name]: target for name, target in report["config_snapshot"]["prompt_targets"].items()
+        }
+        for owner in [report["baseline"], *report["candidates"]]:
+            for artifact in owner["prompt_artifacts"]:
+                source_text = Path(artifact["source_path"]).read_text(encoding="utf-8")
+                artifact["name"] = renamed[artifact["name"]]
+                artifact["diff"] = module.prompt_diff(source_text, artifact["content"], artifact["name"])
+    elif mutation in {
+        "coordinated_missing_prompt_sources_with_forged_diffs",
+        "coordinated_missing_prompt_sources_with_valid_diffs",
+    }:
+        for name in ("system_prompt", "router_prompt"):
+            missing_path = f"missing/{name}.md"
+            report["config_snapshot"]["paths"][name] = missing_path
+            report["config_snapshot"]["prompt_targets"][name]["source_path"] = missing_path
+            report["artifacts"][name] = missing_path
+        baseline_by_name = {artifact["name"]: artifact for artifact in report["baseline"]["prompt_artifacts"]}
+        for owner in [report["baseline"], *report["candidates"]]:
+            for artifact in owner["prompt_artifacts"]:
+                artifact["source_path"] = report["config_snapshot"]["paths"][artifact["name"]]
+                artifact["diff"] = (
+                    "forged diff"
+                    if mutation == "coordinated_missing_prompt_sources_with_forged_diffs"
+                    else module.prompt_diff(
+                        baseline_by_name[artifact["name"]]["content"],
+                        artifact["content"],
+                        artifact["name"],
+                    )
+                )
+    else:
+        round_record.update(
+            {
+                "optimized_field_names": ["not_a_target"],
+                "prompt_paths": {"not_a_target": "missing/not-a-target.md"},
+                "prompt_sha256": {"not_a_target": module.sha256_text("forged prompt evidence")},
+                "prompt_contents": {"not_a_target": "forged prompt evidence"},
                 "accepted": True,
             }
         )
@@ -3647,7 +3706,40 @@ def test_optimizer_round_audit_rejects_duplicate_round_ids_without_overwriting_a
         assert record["prompt_sha256"]["system_prompt"] == module.sha256_text(content)
 
 
-def test_optimizer_round_audit_normalizes_prompt_keys_without_path_collisions(
+def test_optimizer_round_audit_drops_unknown_prompt_targets(tmp_path: Path):
+    module = load_pipeline_module()
+    records = module.write_optimizer_round_artifacts(
+        run_dir=tmp_path,
+        rounds=[
+            SimpleNamespace(
+                round=1,
+                optimized_field_names=["not_a_target"],
+                candidate_prompts={
+                    "system_prompt": "valid system prompt",
+                    "not_a_target": "forged prompt evidence",
+                },
+                validation_pass_rate=1.0,
+                metric_breakdown={ROUTE_TOOL_ARGS_METRIC: 1.0},
+                accepted=True,
+                acceptance_reason="accepted",
+                skip_reason=None,
+                error_message=None,
+                failed_case_ids=[],
+                round_llm_cost=0.01,
+                round_token_usage={"prompt": 8, "completion": 2, "total": 10},
+                duration_seconds=0.25,
+            )
+        ],
+    )
+    record = records[0]
+
+    assert set(record["prompt_paths"]) == {"system_prompt"}
+    assert record["optimized_field_names"] == []
+    assert record["accepted"] is False
+    assert "unknown prompt target" in record["decision_reason"]
+
+
+def test_optimizer_round_audit_drops_unknown_prompt_keys_without_writing_them(
     tmp_path: Path,
 ):
     module = load_pipeline_module()
@@ -3684,10 +3776,10 @@ def test_optimizer_round_audit_normalizes_prompt_keys_without_path_collisions(
     prompt_paths = record["prompt_paths"]
     prompt_hashes = record["prompt_sha256"]
     assert record["accepted"] is False
-    assert "prompt artifact key" in record["decision_reason"]
+    assert "unknown prompt target" in record["decision_reason"]
     assert prompt_paths["system_prompt"].endswith("system_prompt.md")
     assert prompt_paths["router_prompt"].endswith("router_prompt.md")
-    assert set(prompt_paths) == set(prompt_hashes)
+    assert set(prompt_paths) == set(prompt_hashes) == {"system_prompt", "router_prompt"}
     assert len(prompt_paths) == len(set(prompt_paths)) == len({Path(path) for path in prompt_paths.values()})
     assert Path(prompt_paths["system_prompt"]).read_text(encoding="utf-8") == "valid system prompt"
     assert Path(prompt_paths["router_prompt"]).read_text(encoding="utf-8") == "valid router prompt"
@@ -3699,17 +3791,11 @@ def test_optimizer_round_audit_normalizes_prompt_keys_without_path_collisions(
         content = prompt_path.read_text(encoding="utf-8")
         contents.add(content)
         assert prompt_hashes[key] == module.sha256_text(content)
-    assert contents == {
-        "valid system prompt",
-        "valid router prompt",
-        "traversal prompt",
-        "malformed system prompt",
-        "plain prompt",
-    }
+    assert contents == {"valid system prompt", "valid router prompt"}
 
 
 @pytest.mark.parametrize("reserved_name", ["CON", "nul.txt", "Com1.json", "LPT9.log"])
-def test_optimizer_round_audit_normalizes_reserved_prompt_filenames(
+def test_optimizer_round_audit_drops_reserved_unknown_prompt_targets(
     tmp_path: Path,
     reserved_name: str,
 ):
@@ -3737,10 +3823,8 @@ def test_optimizer_round_audit_normalizes_reserved_prompt_filenames(
     record = records[0]
 
     assert record["accepted"] is False
-    assert "prompt artifact key" in record["decision_reason"]
-    assert all(
-        Path(path).stem.casefold() != Path(reserved_name).stem.casefold() for path in record["prompt_paths"].values()
-    )
+    assert "unknown prompt target" in record["decision_reason"]
+    assert record["prompt_paths"] == {}
 
 
 @pytest.mark.parametrize("candidate_prompts", [None, ["not a mapping"]])
@@ -3762,7 +3846,7 @@ def test_optimizer_round_audit_normalizes_malformed_prompt_payloads(
     assert "candidate_prompts" in record["decision_reason"]
 
 
-def test_optimizer_round_audit_disambiguates_casefolded_prompt_filenames(
+def test_optimizer_round_audit_drops_casefolded_unknown_prompt_targets(
     tmp_path: Path,
 ):
     module = load_pipeline_module()
@@ -3789,16 +3873,11 @@ def test_optimizer_round_audit_disambiguates_casefolded_prompt_filenames(
     record = records[0]
 
     json.dumps(records, allow_nan=False)
-    paths = [Path(path) for path in record["prompt_paths"].values()]
-    assert len(paths) == 2
-    assert len({path.name.casefold() for path in paths}) == 2
+    assert record["prompt_paths"] == {}
+    assert record["prompt_sha256"] == {}
+    assert record["prompt_contents"] == {}
     assert record["accepted"] is False
-    assert "case-insensitive" in record["decision_reason"]
-    contents = {path.read_text(encoding="utf-8") for path in paths}
-    assert contents == {"first", "second"}
-    for key, path_value in record["prompt_paths"].items():
-        content = Path(path_value).read_text(encoding="utf-8")
-        assert record["prompt_sha256"][key] == module.sha256_text(content)
+    assert "unknown prompt target" in record["decision_reason"]
 
 
 def test_optimizer_round_audit_drops_non_string_collection_members_and_mapping_keys(

@@ -2712,6 +2712,16 @@
     "evaluation_sha256": "a2a1ec7e174d243b397ee7875d7528cb198d1c1d3fbce9dc82f8cb85e33fe166",
     "evaluation_metrics_sha256": "a2a1ec7e174d243b397ee7875d7528cb198d1c1d3fbce9dc82f8cb85e33fe166",
     "optimizer_config_sha256": "9df0a82039d6de55660169bf6061572da99b647f0141cdfcd5c6f0b4cd448d98",
+    "prompt_targets": {
+      "system_prompt": {
+        "source_path": "examples/optimization/eval_optimize_loop/agent/prompts/system.md",
+        "sha256": "ac2208517d00b42bccfc2336108753e0e3c0ea238345c6b851896b09a4819ab3"
+      },
+      "router_prompt": {
+        "source_path": "examples/optimization/eval_optimize_loop/agent/prompts/router.md",
+        "sha256": "1897b273cf69ace89b50e5c9ba77e135935544bd67100ecd11c78ee7fa317f10"
+      }
+    },
     "evalsets": {
       "train": {
         "path": "examples/optimization/eval_optimize_loop/train.evalset.json",

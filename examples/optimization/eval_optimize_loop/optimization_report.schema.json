@@ -177,6 +177,15 @@
         "diff": {"type": "string"}
       }
     },
+    "promptTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_path", "sha256"],
+      "properties": {
+        "source_path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
     "baseline": {
       "type": "object",
       "additionalProperties": false,
@@ -765,6 +774,7 @@
         "evaluation_sha256",
         "evaluation_metrics_sha256",
         "optimizer_config_sha256",
+        "prompt_targets",
         "evalsets",
         "paths"
       ],
@@ -776,6 +786,15 @@
         "evaluation_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "evaluation_metrics_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "optimizer_config_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "prompt_targets": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["system_prompt", "router_prompt"],
+          "properties": {
+            "system_prompt": {"$ref": "#/$defs/promptTarget"},
+            "router_prompt": {"$ref": "#/$defs/promptTarget"}
+          }
+        },
         "evalsets": {
           "type": "object",
           "additionalProperties": false,

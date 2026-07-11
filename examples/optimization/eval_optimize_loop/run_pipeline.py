@@ -56,6 +56,7 @@ REPORT_SCHEMA_PATH = HERE / "optimization_report.schema.json"
 PROMPT_DIR = HERE / "agent" / "prompts"
 SYSTEM_PROMPT_PATH = PROMPT_DIR / "system.md"
 ROUTER_PROMPT_PATH = PROMPT_DIR / "router.md"
+PROMPT_TARGET_NAMES = ("system_prompt", "router_prompt")
 DEFAULT_RUNS_DIR = HERE / "runs"
 DEFAULT_SEED = 7
 DEFAULT_MAX_SECONDS = 180.0
@@ -279,19 +280,12 @@ def validate_report_schema(report: dict[str, Any]) -> None:
                 candidate_path = REPO_ROOT / candidate_path
             if candidate_path.is_file() and candidate_path.read_text(encoding="utf-8") != content:
                 reject(f"{label} prompt artifact content does not match the referenced file")
-            source_path = Path(artifact["source_path"])
-            if not source_path.is_absolute():
-                source_path = REPO_ROOT / source_path
-            if source_path.is_file():
-                source_text = source_path.read_text(encoding="utf-8")
-                if artifact["diff"] != prompt_diff(source_text, content, artifact["name"]):
-                    reject(f"{label} prompt artifact diff does not match source and candidate content")
 
     for summary_name in ("train", "optimizer_dev", "validation", "final_validation"):
         reject_duplicate_cases(baseline[summary_name], f"baseline.{summary_name}")
         validate_evaluation_summary(baseline[summary_name], f"baseline.{summary_name}")
     validate_prompt_artifacts(baseline["prompt_artifacts"], "baseline")
-    baseline_prompt_names = {artifact["name"] for artifact in baseline["prompt_artifacts"]}
+    baseline_prompts_by_name = {artifact["name"]: artifact for artifact in baseline["prompt_artifacts"]}
 
     if report["failure_attribution"] != attribution_for(baseline["validation"]):
         reject("top-level failure attribution does not match baseline validation failures")
@@ -313,6 +307,34 @@ def validate_report_schema(report: dict[str, Any]) -> None:
         reject("evaluation config hash does not match the normalized snapshot")
     expected_judge_multiplier = judge_calls_per_agent_call(evaluation_snapshot)
     config_paths = config_snapshot["paths"]
+    expected_prompt_names = set(PROMPT_TARGET_NAMES)
+    prompt_targets = config_snapshot["prompt_targets"]
+    if set(prompt_targets) != expected_prompt_names:
+        reject("prompt target manifest must contain exactly the registered target names")
+    if set(baseline_prompts_by_name) != expected_prompt_names:
+        reject("baseline prompt artifacts must match the registered target names")
+    for name in PROMPT_TARGET_NAMES:
+        target = prompt_targets[name]
+        baseline_artifact = baseline_prompts_by_name[name]
+        expected_source_path = config_paths[name]
+        if target["source_path"] != expected_source_path:
+            reject(f"prompt target source path does not match config paths: {name}")
+        if report["artifacts"].get(name) != expected_source_path:
+            reject(f"prompt source path does not match report artifacts: {name}")
+        if baseline_artifact["source_path"] != expected_source_path:
+            reject(f"baseline prompt source path does not match target manifest: {name}")
+        if target["sha256"] != baseline_artifact["sha256"]:
+            reject(f"prompt target hash does not match baseline content: {name}")
+        if baseline_artifact["diff"] != prompt_diff(baseline_artifact["content"], baseline_artifact["content"], name):
+            reject(f"baseline prompt diff does not match embedded baseline content: {name}")
+        source_path = Path(expected_source_path)
+        if not source_path.is_absolute():
+            source_path = REPO_ROOT / source_path
+        if not source_path.is_file():
+            reject(f"referenced prompt source artifact must exist: {name}")
+        source_text = source_path.read_text(encoding="utf-8")
+        if sha256_text(source_text) != target["sha256"] or source_text != baseline_artifact["content"]:
+            reject(f"prompt target manifest does not match the referenced source artifact: {name}")
     expected_optimizer_config_path = config_paths["optimizer_config"]
     if report["artifacts"].get("optimizer_config") != expected_optimizer_config_path:
         reject("optimizer config path does not match report artifacts")
@@ -375,6 +397,8 @@ def validate_report_schema(report: dict[str, Any]) -> None:
         reject("optimization round identifiers must be unique")
     for round_record in report["optimization_rounds"]:
         prompt_keys = set(round_record["prompt_paths"])
+        if not prompt_keys.issubset(expected_prompt_names):
+            reject("optimization round contains an unknown prompt target")
         if prompt_keys != set(round_record["prompt_sha256"]) or prompt_keys != set(round_record["prompt_contents"]):
             reject("optimization round prompt path, hash, and content keys must match")
         for name in prompt_keys:
@@ -460,8 +484,21 @@ def validate_report_schema(report: dict[str, Any]) -> None:
         if candidate_audit["config_sha256"] != expected_optimizer_config_hash:
             reject(f"candidate audit config hash does not match config snapshot: {candidate_id}")
         validate_prompt_artifacts(candidate["prompt_artifacts"], f"candidate {candidate_id}")
-        if {artifact["name"] for artifact in candidate["prompt_artifacts"]} != baseline_prompt_names:
+        candidate_prompts_by_name = {artifact["name"]: artifact for artifact in candidate["prompt_artifacts"]}
+        if set(candidate_prompts_by_name) != expected_prompt_names:
             reject(f"candidate prompt artifact names must match baseline targets: {candidate_id}")
+        for name in PROMPT_TARGET_NAMES:
+            candidate_artifact = candidate_prompts_by_name[name]
+            baseline_artifact = baseline_prompts_by_name[name]
+            if candidate_artifact["source_path"] != prompt_targets[name]["source_path"]:
+                reject(f"candidate prompt source path must match target manifest: {candidate_id}/{name}")
+            expected_diff = prompt_diff(
+                baseline_artifact["content"],
+                candidate_artifact["content"],
+                name,
+            )
+            if candidate_artifact["diff"] != expected_diff:
+                reject(f"candidate prompt diff does not match embedded baseline: {candidate_id}/{name}")
         pipeline_cost = cost["estimated_total"]
         audit_cost = candidate_audit["cost"]
         if audit_cost["known"] is not (pipeline_cost is not None) or audit_cost["estimated"] != pipeline_cost:
@@ -888,35 +925,6 @@ def _prompt_sort_key(item: tuple[Any, Any]) -> tuple[str, str]:
     return type(name).__name__, repr(name)
 
 
-def _normalized_prompt_artifact_key(
-    name: Any,
-    used_names: set[str],
-) -> tuple[str, bool, bool]:
-    if isinstance(name, str) and name in {"system_prompt", "router_prompt"}:
-        used_names.add(name)
-        return name, False, False
-    if isinstance(name, str):
-        normalized_name = Path(name).name
-        normalized_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", normalized_name)
-        normalized_name = normalized_name.strip(" .")
-    else:
-        normalized_name = f"prompt_{type(name).__name__}"
-    if not normalized_name or normalized_name in {".", ".."}:
-        normalized_name = "prompt"
-    if _is_windows_reserved_name(normalized_name):
-        normalized_name = f"prompt_{normalized_name}"
-
-    base_name = normalized_name
-    suffix = 2
-    casefold_collision = False
-    used_casefold_names = {used_name.casefold() for used_name in used_names}
-    while normalized_name.casefold() in used_casefold_names:
-        casefold_collision = True
-        normalized_name = f"{base_name}__{suffix}"
-        suffix += 1
-    return normalized_name, normalized_name != name, casefold_collision
-
-
 def write_optimizer_round_artifacts(
     *,
     run_dir: Path,
@@ -958,25 +966,13 @@ def write_optimizer_round_artifacts(
             prompt_reasons.append("candidate_prompts was not a mapping and was normalized to an empty mapping")
             raw_candidate_prompts = {}
         raw_prompt_items = sorted(raw_candidate_prompts.items(), key=_prompt_sort_key)
-        used_prompt_names = {
-            raw_name
-            for raw_name, _ in raw_prompt_items
-            if isinstance(raw_name, str) and raw_name in {"system_prompt", "router_prompt"}
-        }
         for raw_name, raw_content in raw_prompt_items:
-            name, name_was_normalized, casefold_collision = _normalized_prompt_artifact_key(
-                raw_name,
-                used_prompt_names,
-            )
-            used_prompt_names.add(name)
-            if name_was_normalized:
+            if not isinstance(raw_name, str) or raw_name not in PROMPT_TARGET_NAMES:
                 invalid_prompt_evidence = True
-                if "prompt artifact key was normalized safely" not in prompt_reasons:
-                    prompt_reasons.append("prompt artifact key was normalized safely")
-            if casefold_collision:
-                invalid_prompt_evidence = True
-                if "prompt filenames collided case-insensitively" not in prompt_reasons:
-                    prompt_reasons.append("prompt filenames collided case-insensitively and were disambiguated")
+                if "unknown prompt target was dropped" not in prompt_reasons:
+                    prompt_reasons.append("unknown prompt target was dropped")
+                continue
+            name = raw_name
             if isinstance(raw_content, str):
                 content = raw_content
             else:
@@ -1602,6 +1598,16 @@ def read_source_prompts(system_prompt: Path, router_prompt: Path) -> dict[str, t
     return {
         "system_prompt": (system_prompt, system_prompt.read_text(encoding="utf-8")),
         "router_prompt": (router_prompt, router_prompt.read_text(encoding="utf-8")),
+    }
+
+
+def build_prompt_target_manifest(
+    source_prompts: Mapping[str, tuple[Path, str]],
+) -> dict[str, dict[str, str]]:
+    return {
+        name: {"source_path": str(source_path), "sha256": sha256_text(source_text)}
+        for name in PROMPT_TARGET_NAMES
+        for source_path, source_text in [source_prompts[name]]
     }
 
 
@@ -3124,6 +3130,7 @@ async def build_offline_report(
             "evaluation_sha256": sha256_json(evaluation_snapshot),
             "evaluation_metrics_sha256": sha256_json_file(metrics_path),
             "optimizer_config_sha256": sha256_json_file(optimizer_config),
+            "prompt_targets": build_prompt_target_manifest(source_prompts),
             "evalsets": build_evalset_manifests(train_evalset, optimizer_dev_evalset, val_evalset),
             "paths": {
                 "train_evalset": str(train_evalset),
@@ -3669,9 +3676,7 @@ async def run_online(
         run_dir=run_dir,
         candidate_id="baseline",
         source_prompts=source_prompts,
-        candidate_prompts=dict(
-            getattr(result, "baseline_prompts", {}) or {name: text for name, (_, text) in source_prompts.items()}
-        ),
+        candidate_prompts={name: text for name, (_, text) in source_prompts.items()},
         summary="Source prompts before AgentOptimizer.optimize.",
         source_written=False,
     )
@@ -3770,6 +3775,7 @@ async def run_online(
             "evaluation_sha256": sha256_json(evaluation_snapshot),
             "evaluation_metrics_sha256": sha256_json_file(metrics_path),
             "optimizer_config_sha256": sha256_json_file(runtime_optimizer_path),
+            "prompt_targets": build_prompt_target_manifest(source_prompts),
             "evalsets": build_evalset_manifests(train_path, optimizer_dev_path, val_path),
             "paths": {
                 "train_evalset": str(train_path),
