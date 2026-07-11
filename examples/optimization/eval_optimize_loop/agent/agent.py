@@ -14,7 +14,6 @@ from trpc_agent_sdk.models import OpenAIModel
 
 from .config import get_model_config
 
-
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 SYSTEM_PROMPT_PATH = PROMPT_DIR / "system.md"
 ROUTER_PROMPT_PATH = PROMPT_DIR / "router.md"

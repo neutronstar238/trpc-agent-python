@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 
-
 REQUIRED_ENV_VARS = (
     "TRPC_AGENT_API_KEY",
     "TRPC_AGENT_BASE_URL",
