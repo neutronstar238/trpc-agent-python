@@ -1642,6 +1642,86 @@ def test_optimizer_round_audit_rejects_duplicate_round_ids_without_overwriting_a
         assert record["prompt_sha256"]["system_prompt"] == module.sha256_text(content)
 
 
+def test_optimizer_round_audit_normalizes_prompt_keys_without_path_collisions(
+    tmp_path: Path,
+):
+    module = load_pipeline_module()
+    round_dir = tmp_path / "prompts" / "optimizer_round_001"
+    records = module.write_optimizer_round_artifacts(
+        run_dir=tmp_path,
+        rounds=[
+            SimpleNamespace(
+                round=1,
+                optimized_field_names=["system_prompt"],
+                candidate_prompts={
+                    "system_prompt": "valid system prompt",
+                    "router_prompt": "valid router prompt",
+                    "a/../b": "traversal prompt",
+                    "a/../system_prompt": "malformed system prompt",
+                    "b": "plain prompt",
+                },
+                validation_pass_rate=1.0,
+                metric_breakdown={ROUTE_TOOL_ARGS_METRIC: 1.0},
+                accepted=True,
+                acceptance_reason="accepted",
+                skip_reason=None,
+                error_message=None,
+                failed_case_ids=[],
+                round_llm_cost=0.01,
+                round_token_usage={"prompt": 8, "completion": 2, "total": 10},
+                duration_seconds=0.25,
+            )
+        ],
+    )
+    record = records[0]
+
+    json.dumps(records, allow_nan=False)
+    prompt_paths = record["prompt_paths"]
+    prompt_hashes = record["prompt_sha256"]
+    assert record["accepted"] is False
+    assert "prompt artifact key" in record["decision_reason"]
+    assert prompt_paths["system_prompt"].endswith("system_prompt.md")
+    assert prompt_paths["router_prompt"].endswith("router_prompt.md")
+    assert set(prompt_paths) == set(prompt_hashes)
+    assert len(prompt_paths) == len(set(prompt_paths)) == len({Path(path) for path in prompt_paths.values()})
+    assert Path(prompt_paths["system_prompt"]).read_text(encoding="utf-8") == "valid system prompt"
+    assert Path(prompt_paths["router_prompt"]).read_text(encoding="utf-8") == "valid router prompt"
+
+    contents = set()
+    for key, path_value in prompt_paths.items():
+        prompt_path = Path(path_value)
+        assert prompt_path.resolve().is_relative_to(round_dir.resolve())
+        content = prompt_path.read_text(encoding="utf-8")
+        contents.add(content)
+        assert prompt_hashes[key] == module.sha256_text(content)
+    assert contents == {
+        "valid system prompt",
+        "valid router prompt",
+        "traversal prompt",
+        "malformed system prompt",
+        "plain prompt",
+    }
+
+
+@pytest.mark.parametrize("candidate_prompts", [None, ["not a mapping"]])
+def test_optimizer_round_audit_normalizes_malformed_prompt_payloads(
+    tmp_path: Path,
+    candidate_prompts: Any,
+):
+    module = load_pipeline_module()
+    records = module.write_optimizer_round_artifacts(
+        run_dir=tmp_path,
+        rounds=[SimpleNamespace(round=1, candidate_prompts=candidate_prompts)],
+    )
+    record = records[0]
+
+    json.dumps(records, allow_nan=False)
+    assert record["prompt_paths"] == {}
+    assert record["prompt_sha256"] == {}
+    assert record["accepted"] is False
+    assert "candidate_prompts" in record["decision_reason"]
+
+
 @pytest.mark.asyncio
 async def test_online_optimizer_validation_improvement_is_accepted(
     tmp_path: Path,

@@ -193,6 +193,40 @@ def _normalized_round_identifier(value: Any) -> tuple[int, bool]:
     return int(value), False
 
 
+def _normalized_round_list(value: Any) -> tuple[list[Any], bool]:
+    if isinstance(value, list):
+        return list(value), False
+    if isinstance(value, tuple):
+        return list(value), False
+    return [], True
+
+
+def _prompt_sort_key(item: tuple[Any, Any]) -> tuple[str, str]:
+    name = item[0]
+    return type(name).__name__, repr(name)
+
+
+def _normalized_prompt_artifact_key(name: Any, used_names: set[str]) -> tuple[str, bool]:
+    if isinstance(name, str) and name in {"system_prompt", "router_prompt"}:
+        used_names.add(name)
+        return name, False
+    if isinstance(name, str):
+        normalized_name = Path(name).name
+        normalized_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", normalized_name)
+        normalized_name = normalized_name.strip(" .")
+    else:
+        normalized_name = f"prompt_{type(name).__name__}"
+    if not normalized_name or normalized_name in {".", ".."}:
+        normalized_name = "prompt"
+
+    base_name = normalized_name
+    suffix = 2
+    while normalized_name in used_names:
+        normalized_name = f"{base_name}__{suffix}"
+        suffix += 1
+    return normalized_name, normalized_name != name
+
+
 def write_optimizer_round_artifacts(
     *,
     run_dir: Path,
@@ -202,13 +236,17 @@ def write_optimizer_round_artifacts(
     reserved_round_ids = {
         round_id
         for round_record in rounds
-        for round_id, invalid in [_normalized_round_identifier(round_record.round)]
+        for round_id, invalid in [
+            _normalized_round_identifier(getattr(round_record, "round", None))
+        ]
         if not invalid
     }
     used_round_ids: set[int] = set()
     next_fallback_round_id = 1
     for round_record in rounds:
-        round_id, invalid_round_id = _normalized_round_identifier(round_record.round)
+        round_id, invalid_round_id = _normalized_round_identifier(
+            getattr(round_record, "round", None)
+        )
         duplicate_round_id = not invalid_round_id and round_id in used_round_ids
         if invalid_round_id or duplicate_round_id:
             while next_fallback_round_id in reserved_round_ids or next_fallback_round_id in used_round_ids:
@@ -220,13 +258,43 @@ def write_optimizer_round_artifacts(
         round_dir.mkdir(parents=True, exist_ok=True)
         prompt_paths: dict[str, str] = {}
         prompt_hashes: dict[str, str] = {}
-        for name, content in sorted(round_record.candidate_prompts.items()):
+        prompt_reasons: list[str] = []
+        raw_candidate_prompts = getattr(round_record, "candidate_prompts", None)
+        invalid_prompt_evidence = not isinstance(raw_candidate_prompts, dict)
+        if invalid_prompt_evidence:
+            prompt_reasons.append(
+                "candidate_prompts was not a mapping and was normalized to an empty mapping"
+            )
+            raw_candidate_prompts = {}
+        raw_prompt_items = sorted(raw_candidate_prompts.items(), key=_prompt_sort_key)
+        used_prompt_names = {
+            raw_name
+            for raw_name, _ in raw_prompt_items
+            if isinstance(raw_name, str) and raw_name in {"system_prompt", "router_prompt"}
+        }
+        for raw_name, raw_content in raw_prompt_items:
+            name, name_was_normalized = _normalized_prompt_artifact_key(
+                raw_name,
+                used_prompt_names,
+            )
+            used_prompt_names.add(name)
+            if name_was_normalized:
+                invalid_prompt_evidence = True
+                if "prompt artifact key was normalized safely" not in prompt_reasons:
+                    prompt_reasons.append("prompt artifact key was normalized safely")
+            if isinstance(raw_content, str):
+                content = raw_content
+            else:
+                content = ""
+                invalid_prompt_evidence = True
+                if "prompt content was normalized to an empty string" not in prompt_reasons:
+                    prompt_reasons.append("prompt content was normalized to an empty string")
             prompt_path = round_dir / f"{name}.md"
             prompt_path.write_text(content, encoding="utf-8")
             prompt_paths[name] = str(prompt_path)
             prompt_hashes[name] = sha256_text(content)
         validation_pass_rate, invalid_validation_pass_rate = _normalized_round_number(
-            round_record.validation_pass_rate,
+            getattr(round_record, "validation_pass_rate", None),
             nonnegative=True,
         )
         invalid_rate_bounds = invalid_validation_pass_rate or validation_pass_rate > 1
@@ -243,11 +311,11 @@ def write_optimizer_round_artifacts(
             metric_breakdown[str(name)] = normalized
             invalid_numeric_evidence = invalid_numeric_evidence or invalid
         cost_usd, invalid_cost = _normalized_round_number(
-            round_record.round_llm_cost,
+            getattr(round_record, "round_llm_cost", None),
             nonnegative=True,
         )
         duration_seconds, invalid_duration = _normalized_round_number(
-            round_record.duration_seconds,
+            getattr(round_record, "duration_seconds", None),
             nonnegative=True,
         )
         invalid_numeric_evidence = invalid_numeric_evidence or invalid_cost or invalid_duration
@@ -260,13 +328,39 @@ def write_optimizer_round_artifacts(
             normalized, invalid = _normalized_round_count(value)
             token_usage[str(name)] = normalized
             invalid_numeric_evidence = invalid_numeric_evidence or invalid
-        decision_reason = sanitize_report_text(
-            round_record.acceptance_reason
-            or round_record.skip_reason
-            or round_record.error_message
-        ) or "optimizer reported no reason"
-        accepted = bool(round_record.accepted)
-        if invalid_round_id or duplicate_round_id or invalid_numeric_evidence or invalid_rate_bounds:
+        invalid_collection_evidence = False
+        optimized_field_names, invalid_optimized_field_names = _normalized_round_list(
+            getattr(round_record, "optimized_field_names", None)
+        )
+        failed_case_ids, invalid_failed_case_ids = _normalized_round_list(
+            getattr(round_record, "failed_case_ids", None)
+        )
+        invalid_collection_evidence = invalid_optimized_field_names or invalid_failed_case_ids
+        reason_values: list[str] = []
+        invalid_reason_evidence = False
+        for field_name in ("acceptance_reason", "skip_reason", "error_message"):
+            value = getattr(round_record, field_name, None)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                invalid_reason_evidence = True
+                continue
+            if value:
+                reason_values.append(value)
+                break
+        decision_reason = sanitize_report_text(reason_values[0] if reason_values else "") or (
+            "optimizer reported no reason"
+        )
+        accepted = getattr(round_record, "accepted", False) is True
+        if (
+            invalid_round_id
+            or duplicate_round_id
+            or invalid_numeric_evidence
+            or invalid_rate_bounds
+            or invalid_prompt_evidence
+            or invalid_collection_evidence
+            or invalid_reason_evidence
+        ):
             accepted = False
             if invalid_numeric_evidence:
                 decision_reason += "; invalid numeric round evidence was normalized and rejected"
@@ -276,16 +370,22 @@ def write_optimizer_round_artifacts(
                 decision_reason += f"; duplicate round identifier was normalized to {round_id} and rejected"
             if invalid_rate_bounds:
                 decision_reason += "; validation_pass_rate was out of bounds and normalized to 0.0; round rejected"
+            if invalid_collection_evidence:
+                decision_reason += "; invalid round collections were normalized and rejected"
+            if invalid_reason_evidence:
+                decision_reason += "; invalid round reason fields were ignored and rejected"
+            for prompt_reason in prompt_reasons:
+                decision_reason += f"; {prompt_reason}; round rejected"
         records.append({
             "round": round_id,
-            "optimized_field_names": list(round_record.optimized_field_names),
+            "optimized_field_names": optimized_field_names,
             "prompt_paths": prompt_paths,
             "prompt_sha256": prompt_hashes,
             "validation_pass_rate": float(validation_pass_rate),
             "metric_breakdown": metric_breakdown,
             "accepted": accepted,
             "decision_reason": decision_reason,
-            "failed_case_ids": list(round_record.failed_case_ids),
+            "failed_case_ids": failed_case_ids,
             "cost_usd": float(cost_usd),
             "token_usage": token_usage,
             "duration_seconds": float(duration_seconds),
