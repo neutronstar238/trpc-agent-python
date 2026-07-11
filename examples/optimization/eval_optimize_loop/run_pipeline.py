@@ -49,6 +49,7 @@ TRAIN_PATH = HERE / "train.evalset.json"
 OPTIMIZER_DEV_PATH = HERE / "optimizer_dev.evalset.json"
 VAL_PATH = HERE / "val.evalset.json"
 FIXTURE_PATH = HERE / "fixtures" / "fake_outputs.json"
+TRACE_FIXTURE_PATH = HERE / "fixtures" / "trace_outputs.json"
 OPTIMIZER_CONFIG_PATH = HERE / "optimizer.json"
 REPORT_SCHEMA_PATH = HERE / "optimization_report.schema.json"
 PROMPT_DIR = HERE / "agent" / "prompts"
@@ -100,6 +101,9 @@ DEFAULT_GATE_CONFIG = {
     "max_duration_seconds": DEFAULT_MAX_SECONDS,
     "required_metrics": [PRIMARY_METRIC],
 }
+
+SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?$")
+TOKEN_USAGE_KEYS = ("prompt", "completion", "total")
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -175,6 +179,21 @@ def _normalized_round_count(value: Any) -> tuple[int, bool]:
     if normalized.is_integer():
         return int(normalized), False
     return 0, True
+
+
+def _normalized_token_usage(value: Any) -> tuple[dict[str, int], bool]:
+    empty = {name: 0 for name in TOKEN_USAGE_KEYS}
+    if not isinstance(value, dict) or set(value) != set(TOKEN_USAGE_KEYS):
+        return empty, True
+    normalized: dict[str, int] = {}
+    for name in TOKEN_USAGE_KEYS:
+        count, invalid = _normalized_round_count(value[name])
+        if invalid:
+            return empty, True
+        normalized[name] = count
+    if normalized["total"] != normalized["prompt"] + normalized["completion"]:
+        return empty, True
+    return normalized, False
 
 
 def _normalized_round_identifier(value: Any) -> tuple[int, bool]:
@@ -326,18 +345,9 @@ def write_optimizer_round_artifacts(
             nonnegative=True,
         )
         invalid_numeric_evidence = invalid_numeric_evidence or invalid_cost or invalid_duration
-        token_usage: dict[str, int] = {}
         raw_token_usage = getattr(round_record, "round_token_usage", {})
-        if not isinstance(raw_token_usage, dict):
-            raw_token_usage = {}
-            invalid_numeric_evidence = True
-        for name, value in raw_token_usage.items():
-            if not isinstance(name, str):
-                invalid_mapping_key_evidence = True
-                continue
-            normalized, invalid = _normalized_round_count(value)
-            token_usage[name] = normalized
-            invalid_numeric_evidence = invalid_numeric_evidence or invalid
+        token_usage, invalid_token_usage = _normalized_token_usage(raw_token_usage)
+        invalid_numeric_evidence = invalid_numeric_evidence or invalid_token_usage
         invalid_collection_evidence = False
         optimized_field_names, invalid_optimized_field_names = _normalized_round_list(
             getattr(round_record, "optimized_field_names", None)
@@ -375,6 +385,8 @@ def write_optimizer_round_artifacts(
             accepted = False
             if invalid_numeric_evidence:
                 decision_reason += "; invalid numeric round evidence was normalized and rejected"
+            if invalid_token_usage:
+                decision_reason += "; invalid token usage was normalized to prompt/completion/total zeros"
             if invalid_round_id:
                 decision_reason += f"; invalid round identifier was normalized to {round_id} and rejected"
             if duplicate_round_id:
@@ -608,6 +620,21 @@ def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalse
             raise FileNotFoundError(path)
 
 
+def _validate_safe_path_component(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or SAFE_PATH_COMPONENT.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a safe single path component")
+    return value
+
+
+def _resolved_artifact_child(parent: Path, component: str, *, label: str) -> Path:
+    safe_component = _validate_safe_path_component(component, label=label)
+    resolved_parent = parent.resolve()
+    resolved_child = (resolved_parent / safe_component).resolve()
+    if not resolved_child.is_relative_to(resolved_parent):
+        raise ValueError(f"resolved {label} artifact path must stay beneath its parent")
+    return resolved_child
+
+
 def make_run_dir(output_dir: Path | None, run_id: str) -> Path:
     base = output_dir or DEFAULT_RUNS_DIR
     base = base.expanduser()
@@ -615,7 +642,7 @@ def make_run_dir(output_dir: Path | None, run_id: str) -> Path:
         base = (Path.cwd() / base).resolve()
     else:
         base = base.resolve()
-    run_dir = base / run_id
+    run_dir = _resolved_artifact_child(base, run_id, label="run_id")
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
@@ -674,7 +701,7 @@ def write_prompt_artifacts(
     summary: str,
     source_written: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    prompt_dir = run_dir / "prompts" / candidate_id
+    prompt_dir = _resolved_artifact_child(run_dir / "prompts", candidate_id, label="candidate_id")
     prompt_dir.mkdir(parents=True, exist_ok=True)
     audit: list[dict[str, Any]] = []
     patch_lines = [f"candidate: {candidate_id}", f"summary: {summary}", ""]
@@ -1182,6 +1209,7 @@ def materialize_trace_evalset(
     candidate_id: str,
     split: str,
 ) -> tuple[Path, dict[str, Any]]:
+    _validate_safe_path_component(candidate_id, label="candidate_id")
     trace_payload = copy.deepcopy(payload)
     trace_payload["eval_set_id"] = f"{payload['eval_set_id']}_{candidate_id}_{split}_trace"
     trace_payload["description"] = (
@@ -1196,7 +1224,8 @@ def materialize_trace_evalset(
             "role": "model",
         }
         case["actual_conversation"] = [actual_invocation]
-    path = run_dir / "evalsets" / f"{candidate_id}.{split}.trace.evalset.json"
+    trace_name = f"{candidate_id}.{split}.trace.evalset.json"
+    path = _resolved_artifact_child(run_dir / "evalsets", trace_name, label="trace artifact name")
     write_json(path, trace_payload)
     if candidate_id == "candidate_local_patch" and split == "validation":
         write_json(run_dir / "trace_evalset.json", trace_payload)
@@ -1388,18 +1417,17 @@ def apply_gate(
         accepted = False
         reasons.append("baseline and candidate validation scores must be finite numbers")
     min_delta = _finite_float(gate_config.get("min_validation_delta", 0.0))
-    if min_delta is None:
+    if min_delta is None or min_delta < 0:
         accepted = False
-        reasons.append("minimum validation delta must be a finite number")
-    elif validation_delta is not None:
-        if validation_delta <= 0 and min_delta == 0:
-            accepted = False
-            reasons.append("validation score did not improve over baseline")
-        elif validation_delta <= min_delta:
-            accepted = False
-            reasons.append(
-                "validation score improvement " f"{validation_delta:.4f} must be greater than required {min_delta:.4f}"
-            )
+        reasons.append("minimum validation delta must be a finite non-negative number")
+    if validation_delta is not None and validation_delta <= 0:
+        accepted = False
+        reasons.append("validation score did not improve over baseline")
+    elif validation_delta is not None and min_delta is not None and min_delta >= 0 and validation_delta <= min_delta:
+        accepted = False
+        reasons.append(
+            "validation score improvement " f"{validation_delta:.4f} must be greater than required {min_delta:.4f}"
+        )
 
     baseline_ids = set(baseline_by_id)
     candidate_ids = set(candidate_by_id)
@@ -1413,6 +1441,14 @@ def apply_gate(
         reasons.append("candidate introduced unknown validation case(s): " + ", ".join(unexpected_case_ids))
 
     common_case_ids = sorted(baseline_ids & candidate_ids)
+    tag_mismatch_ids = [
+        case_id
+        for case_id in common_case_ids
+        if _normalized_gate_tags(baseline_by_id[case_id]) != _normalized_gate_tags(candidate_by_id[case_id])
+    ]
+    if tag_mismatch_ids:
+        accepted = False
+        reasons.append("baseline/candidate tag mismatch for validation case(s): " + ", ".join(tag_mismatch_ids))
     new_hard_fail_ids = [
         case_id
         for case_id in common_case_ids
@@ -1425,7 +1461,7 @@ def apply_gate(
     critical_regression_ids = [
         case_id
         for case_id in common_case_ids
-        if "critical" in _normalized_gate_tags(candidate_by_id[case_id])
+        if "critical" in _normalized_gate_tags(baseline_by_id[case_id])
         and _finite_float(candidate_by_id[case_id].get("score")) is not None
         and _finite_float(baseline_by_id[case_id].get("score")) is not None
         and _finite_float(candidate_by_id[case_id].get("score")) < _finite_float(baseline_by_id[case_id].get("score"))
@@ -1528,6 +1564,7 @@ def build_candidate_report(
     baseline_val: dict[str, Any],
     gate_config: dict[str, Any],
     duration_seconds: float,
+    gate_duration_seconds: float | None = None,
     cost_usd: float | None,
     seed: int,
     optimizer_config: Path,
@@ -1539,7 +1576,7 @@ def build_candidate_report(
         baseline_val=baseline_val,
         candidate_val=validation,
         gate_config=gate_config,
-        duration_seconds=duration_seconds,
+        duration_seconds=duration_seconds if gate_duration_seconds is None else gate_duration_seconds,
         cost_usd=cost_usd,
     )
     return _json_safe(
@@ -1712,7 +1749,7 @@ def make_report(
             optimizer_dev_evalset=OPTIMIZER_DEV_PATH.resolve(),
             val_evalset=VAL_PATH.resolve(),
             optimizer_config=OPTIMIZER_CONFIG_PATH.resolve(),
-            fixture_path=FIXTURE_PATH.resolve(),
+            fixture_path=(TRACE_FIXTURE_PATH if mode == "trace" else FIXTURE_PATH).resolve(),
             gate_config=load_gate_config(optimizer_config=OPTIMIZER_CONFIG_PATH.resolve()),
             system_prompt=SYSTEM_PROMPT_PATH.resolve(),
             router_prompt=ROUTER_PROMPT_PATH.resolve(),
@@ -1745,6 +1782,8 @@ async def build_offline_report(
     optimizer_dev_payload = load_json(optimizer_dev_evalset)
     val_payload = load_json(val_evalset)
     fixtures = load_json(fixture_path)
+    for candidate_id in fixtures:
+        _validate_safe_path_component(candidate_id, label="candidate_id")
     metrics_path = offline_metrics_path(run_dir)
     source_prompts = read_source_prompts(system_prompt, router_prompt)
     if mode == "trace":
@@ -1921,6 +1960,8 @@ async def build_offline_report(
                 "completion": 0,
                 "total": 0,
             },
+            "token_usage_known": True,
+            "unknown_token_usage_reason": None,
             "optimizer": {
                 "estimated_cost": 0.0,
                 "model_calls": 0,
@@ -1931,12 +1972,21 @@ async def build_offline_report(
                     "completion": 0,
                     "total": 0,
                 },
+                "token_usage_known": True,
+                "unknown_token_usage_reason": None,
             },
             "final_revalidation": {
                 "estimated_cost": 0.0,
                 "agent_calls": 0,
                 "judge_model_calls": 0,
                 "model_calls": 0,
+                "token_usage": {
+                    "prompt": 0,
+                    "completion": 0,
+                    "total": 0,
+                },
+                "token_usage_known": True,
+                "unknown_token_usage_reason": None,
             },
         },
         duration_seconds=time.perf_counter() - started,
@@ -2074,16 +2124,6 @@ def _int_attr(obj: Any, name: str) -> int:
         return 0
 
 
-def _token_usage_dict(value: Any) -> dict[str, int]:
-    if not isinstance(value, dict):
-        return {"prompt": 0, "completion": 0, "total": 0}
-    return {
-        "prompt": int(value.get("prompt", 0) or 0),
-        "completion": int(value.get("completion", 0) or 0),
-        "total": int(value.get("total", 0) or 0),
-    }
-
-
 def _is_llm_metric(metric: dict[str, Any]) -> bool:
     name = str(metric.get("metric_name") or metric.get("metricName") or "")
     criterion = metric.get("criterion") or {}
@@ -2114,13 +2154,17 @@ def online_cost_audit(
     reflection_calls = _int_attr(result, "total_reflection_lm_calls")
     judge_calls = _int_attr(result, "total_judge_model_calls")
     optimizer_calls = reflection_calls + judge_calls
-    token_usage = _token_usage_dict(getattr(result, "total_token_usage", {}))
+    token_usage, invalid_token_usage = _normalized_token_usage(getattr(result, "total_token_usage", {}))
     raw_cost = getattr(result, "total_llm_cost", None)
     optimizer_cost: float | None = None
     if raw_cost is not None:
         try:
             parsed_cost = float(raw_cost)
-            if parsed_cost != 0.0 or (optimizer_calls == 0 and token_usage["total"] == 0):
+            if (
+                math.isfinite(parsed_cost)
+                and parsed_cost >= 0
+                and (parsed_cost != 0.0 or (optimizer_calls == 0 and token_usage["total"] == 0))
+            ):
                 optimizer_cost = parsed_cost
         except (TypeError, ValueError):
             optimizer_cost = None
@@ -2130,9 +2174,21 @@ def online_cost_audit(
     if optimizer_cost is None and (optimizer_calls > 0 or token_usage["total"] > 0):
         unknown_reasons.append("optimizer returned calls or tokens without a provider-priced cost")
         total_cost = None
+    if invalid_token_usage:
+        unknown_reasons.append("optimizer token usage was malformed and normalized to zero")
     if final_revalidation_calls["model_calls"] > 0:
         unknown_reasons.append("final revalidation model calls are not provider-priced by AgentEvaluator")
         total_cost = None
+
+    final_tokens_known = final_revalidation_calls["model_calls"] == 0
+    final_token_usage = {name: 0 for name in TOKEN_USAGE_KEYS} if final_tokens_known else None
+    pipeline_tokens_known = not invalid_token_usage and final_tokens_known
+    pipeline_token_usage = token_usage if pipeline_tokens_known else None
+    token_unknown_reasons = []
+    if invalid_token_usage:
+        token_unknown_reasons.append("optimizer token usage was malformed")
+    if not final_tokens_known:
+        token_unknown_reasons.append("AgentEvaluator does not expose final revalidation token usage")
 
     return {
         "currency": "USD",
@@ -2140,17 +2196,26 @@ def online_cost_audit(
         "cost_source": "unknown" if unknown_reasons else "optimizer_result",
         "unknown_cost_reason": "; ".join(unknown_reasons) if unknown_reasons else None,
         "model_calls": optimizer_calls + final_revalidation_calls["model_calls"],
-        "token_usage": token_usage,
+        "token_usage": pipeline_token_usage,
+        "token_usage_known": pipeline_tokens_known,
+        "unknown_token_usage_reason": "; ".join(token_unknown_reasons) if token_unknown_reasons else None,
         "optimizer": {
             "estimated_cost": optimizer_cost,
             "model_calls": optimizer_calls,
             "reflection_lm_calls": reflection_calls,
             "judge_model_calls": judge_calls,
             "token_usage": token_usage,
+            "token_usage_known": not invalid_token_usage,
+            "unknown_token_usage_reason": "malformed optimizer token usage" if invalid_token_usage else None,
         },
         "final_revalidation": {
             "estimated_cost": None,
             **final_revalidation_calls,
+            "token_usage": final_token_usage,
+            "token_usage_known": final_tokens_known,
+            "unknown_token_usage_reason": (
+                None if final_tokens_known else "AgentEvaluator does not expose token usage"
+            ),
         },
     }
 
@@ -2179,7 +2244,8 @@ async def run_fake_or_trace(
     optimizer_dev_path = resolve_path(optimizer_dev_evalset, OPTIMIZER_DEV_PATH)
     val_path = resolve_path(val_evalset, VAL_PATH)
     optimizer_path = resolve_path(optimizer_config, OPTIMIZER_CONFIG_PATH)
-    fixture_path = resolve_path(fixture_outputs, FIXTURE_PATH)
+    fixture_default = TRACE_FIXTURE_PATH if mode == "trace" else FIXTURE_PATH
+    fixture_path = resolve_path(fixture_outputs, fixture_default)
     system_path = resolve_path(system_prompt, SYSTEM_PROMPT_PATH)
     router_path = resolve_path(router_prompt, ROUTER_PROMPT_PATH)
     validate_inputs(train_path, optimizer_dev_path, val_path)
@@ -2257,6 +2323,7 @@ async def run_online(
         )
     finally:
         _restore_route_tool_args_metric(route_metric_state)
+    optimization_finished = time.perf_counter()
 
     train_payload = load_json(train_path)
     optimizer_dev_payload = load_json(optimizer_dev_path)
@@ -2291,7 +2358,8 @@ async def run_online(
         metrics_path=metrics_path,
         call_agent=baseline_call_agent,
     )
-    candidate_started = time.perf_counter()
+    baseline_finished = time.perf_counter()
+    candidate_started = baseline_finished
     best_train = await run_evaluator(
         evalset_path=train_path,
         evalset_payload=train_payload,
@@ -2310,6 +2378,9 @@ async def run_online(
         metrics_path=metrics_path,
         call_agent=best_call_agent,
     )
+    candidate_finished = time.perf_counter()
+    candidate_duration_seconds = candidate_finished - candidate_started
+    gate_elapsed_seconds = candidate_finished - started
 
     metrics_config = load_json(metrics_path)
     cost = online_cost_audit(
@@ -2349,7 +2420,6 @@ async def run_online(
         run_dir=run_dir,
         rounds=list(getattr(result, "rounds", []) or []),
     )
-    candidate_duration_seconds = time.perf_counter() - candidate_started
     candidate = build_candidate_report(
         candidate_id="optimizer_best",
         fixture=_optimizer_fixture(result),
@@ -2361,6 +2431,7 @@ async def run_online(
         baseline_val=baseline_val,
         gate_config=gate,
         duration_seconds=candidate_duration_seconds,
+        gate_duration_seconds=gate_elapsed_seconds,
         cost_usd=cost_usd,
         seed=seed,
         optimizer_config=optimizer_path,
@@ -2383,6 +2454,9 @@ async def run_online(
         error_message = sanitize_report_text(getattr(result, "error_message", ""))
         if error_message:
             candidate["gate"]["reasons"].append(error_message)
+    if not cost["optimizer"]["token_usage_known"]:
+        candidate["gate"]["accepted"] = False
+        candidate["gate"]["reasons"].append("optimizer token usage was malformed and cannot be audited")
 
     artifacts = common_artifacts(
         run_dir=run_dir,
@@ -2437,6 +2511,12 @@ async def run_online(
         extra={
             **_optimizer_extra(result),
             "online_preflight": preflight,
+            "online_duration": {
+                "optimization_seconds": round(optimization_finished - started, 6),
+                "baseline_revalidation_seconds": round(baseline_finished - optimization_finished, 6),
+                "candidate_revalidation_seconds": round(candidate_duration_seconds, 6),
+                "gate_elapsed_seconds": round(gate_elapsed_seconds, 6),
+            },
             "optimization_rounds": optimization_rounds,
         },
     )
@@ -2536,7 +2616,7 @@ async def amain(argv: list[str] | None = None) -> Path:
     parser.add_argument("--optimizer-dev-evalset", type=Path, default=OPTIMIZER_DEV_PATH)
     parser.add_argument("--val-evalset", type=Path, default=VAL_PATH)
     parser.add_argument("--optimizer-config", type=Path, default=OPTIMIZER_CONFIG_PATH)
-    parser.add_argument("--fixture-outputs", type=Path, default=FIXTURE_PATH)
+    parser.add_argument("--fixture-outputs", type=Path, default=None)
     parser.add_argument("--gate-config", type=Path, default=None)
     parser.add_argument("--system-prompt", type=Path, default=SYSTEM_PROMPT_PATH)
     parser.add_argument("--router-prompt", type=Path, default=ROUTER_PROMPT_PATH)

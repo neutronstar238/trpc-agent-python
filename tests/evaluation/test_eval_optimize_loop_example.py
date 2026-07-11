@@ -44,6 +44,110 @@ def _gate_summary(
     }
 
 
+def _complete_summary(score: float, *, passed: bool, tags: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "eval_set_id": "stubbed_online",
+        "score": score,
+        "pass_rate": 1.0 if passed else 0.0,
+        "metrics": {
+            ROUTE_TOOL_ARGS_METRIC: {
+                "score": score,
+                "threshold": 1.0,
+                "passed": passed,
+                "status": "passed" if passed else "failed",
+            }
+        },
+        "case_results": [
+            {
+                "case_id": "case_1",
+                "tags": tags or [],
+                "user": "stubbed user",
+                "score": score,
+                "passed": passed,
+                "metrics": {},
+                "actual_text": "",
+                "expected_text": "",
+                "key_trace": {
+                    "invocation_id": "case_1",
+                    "actual_final_response": "",
+                    "expected_final_response": "",
+                    "error_message": None,
+                },
+                "root_cause": "" if passed else "final_response_mismatch",
+                "reasons": [] if passed else ["stubbed mismatch"],
+            }
+        ],
+        "failed_case_ids": [] if passed else ["case_1"],
+        "source": "AgentEvaluator",
+    }
+
+
+def _optimizer_result(token_usage: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        status="SUCCEEDED",
+        error_message="",
+        baseline_pass_rate=0.0,
+        best_pass_rate=1.0,
+        pass_rate_improvement=1.0,
+        stop_reason="completed",
+        total_llm_cost=0.01,
+        total_reflection_lm_calls=1,
+        total_judge_model_calls=0,
+        total_token_usage=token_usage,
+        best_prompts={"system_prompt": "better system", "router_prompt": "better router"},
+        baseline_prompts={"system_prompt": "baseline system", "router_prompt": "baseline router"},
+        baseline_metric_breakdown={ROUTE_TOOL_ARGS_METRIC: 0.0},
+        best_metric_breakdown={ROUTE_TOOL_ARGS_METRIC: 1.0},
+        rounds=[],
+    )
+
+
+async def _run_stubbed_online(
+    *,
+    module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    result: SimpleNamespace,
+    run_id: str,
+    gate_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    monkeypatch.setenv("TRPC_AGENT_API_KEY", "fake-key")
+    monkeypatch.setenv("TRPC_AGENT_BASE_URL", "http://localhost/fake")
+    monkeypatch.setenv("TRPC_AGENT_MODEL_NAME", "fake-model")
+
+    async def fake_optimize(**kwargs: Any) -> SimpleNamespace:
+        output_dir = Path(kwargs["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "result.json").write_text("{}", encoding="utf-8")
+        return result
+
+    summaries = iter(
+        [
+            _complete_summary(0.0, passed=False),
+            _complete_summary(0.0, passed=False),
+            _complete_summary(0.0, passed=False),
+            _complete_summary(1.0, passed=True),
+            _complete_summary(1.0, passed=True),
+            _complete_summary(1.0, passed=True),
+        ]
+    )
+
+    async def fake_run_evaluator(**_: Any) -> dict[str, Any]:
+        return next(summaries)
+
+    import trpc_agent_sdk.evaluation as evaluation_pkg
+
+    monkeypatch.setattr(evaluation_pkg.AgentOptimizer, "optimize", staticmethod(fake_optimize))
+    monkeypatch.setattr(module, "run_evaluator", fake_run_evaluator)
+    run_dir = await module.run_online(
+        seed=7,
+        output_dir=tmp_path,
+        run_id=run_id,
+        gate_config=gate_config,
+    )
+    return load_report(run_dir / "optimization_report.json")
+
+
 def load_pipeline_module() -> Any:
     spec = importlib.util.spec_from_file_location("eval_optimize_loop_run_pipeline", RUN_PIPELINE)
     module = importlib.util.module_from_spec(spec)
@@ -138,6 +242,9 @@ def test_gate_fails_closed_for_boundary_and_invalid_evidence():
         ("config", "0.1", {"min_validation_delta": "0.1"}),
         ("config", True, {"min_validation_delta": True}),
         ("config", float("nan"), {"min_validation_delta": float("nan")}),
+        ("config", float("inf"), {"min_validation_delta": float("inf")}),
+        ("config", float("-inf"), {"min_validation_delta": float("-inf")}),
+        ("config", -0.1, {"min_validation_delta": -0.1}),
         ("config", "10", {"max_duration_seconds": "10"}),
         ("config", True, {"max_cost_usd": True}),
         ("config", float("inf"), {"max_cost_usd": float("inf")}),
@@ -175,6 +282,75 @@ def test_gate_rejects_malformed_numeric_evidence_without_raising(
 
     assert result["accepted"] is False
     json.dumps(result, allow_nan=False)
+
+
+def test_gate_rejects_regression_even_when_minimum_delta_is_negative():
+    module = load_pipeline_module()
+    baseline = _gate_summary(
+        0.75,
+        [{"case_id": "a", "score": 0.75, "passed": True, "tags": []}],
+    )
+    candidate = _gate_summary(
+        0.5,
+        [{"case_id": "a", "score": 0.5, "passed": True, "tags": []}],
+    )
+
+    result = module.apply_gate(
+        candidate_id="regression",
+        baseline_val=baseline,
+        candidate_val=candidate,
+        gate_config={
+            "min_validation_delta": -0.5,
+            "allow_critical_regression": True,
+            "required_metrics": [ROUTE_TOOL_ARGS_METRIC],
+        },
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+
+    assert result["accepted"] is False
+    assert "did not improve" in " ".join(result["reasons"])
+
+
+@pytest.mark.parametrize(
+    ("baseline_tags", "candidate_tags"),
+    [
+        (["critical", "validation"], ["validation"]),
+        (["validation"], ["validation", "critical"]),
+        (["validation", "refund"], ["validation", "faq"]),
+    ],
+)
+def test_gate_rejects_tag_mismatch_and_uses_baseline_for_critical_status(
+    baseline_tags: list[str],
+    candidate_tags: list[str],
+):
+    module = load_pipeline_module()
+    baseline = _gate_summary(
+        0.5,
+        [{"case_id": "a", "score": 1.0, "passed": True, "tags": baseline_tags}],
+    )
+    candidate = _gate_summary(
+        0.75,
+        [{"case_id": "a", "score": 0.5, "passed": True, "tags": candidate_tags}],
+    )
+
+    result = module.apply_gate(
+        candidate_id="retagged",
+        baseline_val=baseline,
+        candidate_val=candidate,
+        gate_config={
+            "min_validation_delta": 0.0,
+            "allow_new_hard_fails": True,
+            "required_metrics": [ROUTE_TOOL_ARGS_METRIC],
+        },
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+
+    assert result["accepted"] is False
+    assert "tag mismatch" in " ".join(result["reasons"])
+    if "critical" in baseline_tags:
+        assert result["critical_regression_ids"] == ["a"]
 
 
 @pytest.mark.parametrize(
@@ -623,6 +799,29 @@ def test_evalsets_and_optimizer_config_are_schema_loadable():
     assert "val_shipping_delay_103" in {case.eval_id for case in val.eval_cases}
     assert {case.eval_id for case in optimizer_dev.eval_cases}.isdisjoint({case.eval_id for case in val.eval_cases})
 
+    def evidence_sets(evalset: Any) -> tuple[set[str], set[str], set[str]]:
+        ids = {case.eval_id for case in evalset.eval_cases}
+        users = {
+            "".join(part.text or "" for part in case.conversation[0].user_content.parts) for case in evalset.eval_cases
+        }
+        gold = {
+            "".join(part.text or "" for part in case.conversation[0].final_response.parts)
+            for case in evalset.eval_cases
+        }
+        return ids, users, gold
+
+    train_evidence = evidence_sets(train)
+    optimizer_dev_evidence = evidence_sets(optimizer_dev)
+    validation_evidence = evidence_sets(val)
+    assert len(optimizer_dev.eval_cases) == 3
+    for optimizer_values, train_values, validation_values in zip(
+        optimizer_dev_evidence,
+        train_evidence,
+        validation_evidence,
+    ):
+        assert optimizer_values.isdisjoint(train_values)
+        assert optimizer_values.isdisjoint(validation_values)
+
     config = load_optimize_config(str(EXAMPLE_DIR / "optimizer.json"))
     assert config.optimize.algorithm.name == "gepa_reflective"
     assert {metric.metric_name for metric in config.evaluate.get_eval_metrics()} == {
@@ -646,6 +845,8 @@ def test_readme_includes_design_notes_and_sample_report_shape():
     assert "fixtures/optimization_report.sample.json" in readme
     assert "candidate_local_patch" in readme
     assert "candidate_overfit" in readme
+    assert "not globally suppressed" in readme
+    assert "cleanup defect" in readme
 
     sample = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
     required = {
@@ -874,6 +1075,24 @@ def test_report_schema_requires_consistent_candidate_audit_cost(
         module.validate_report_schema(report)
 
 
+@pytest.mark.parametrize(
+    ("known", "reason"),
+    [(True, "must be null when known"), (False, None)],
+)
+def test_report_schema_requires_consistent_optimizer_token_accounting(
+    known: bool,
+    reason: str | None,
+):
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    optimizer = report["cost"]["optimizer"]
+    optimizer["token_usage_known"] = known
+    optimizer["unknown_token_usage_reason"] = reason
+
+    with pytest.raises(ValidationError):
+        module.validate_report_schema(report)
+
+
 def test_report_schema_allows_empty_no_run_case_metrics():
     module = load_pipeline_module()
     report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
@@ -904,6 +1123,74 @@ def test_report_schema_rejects_extra_core_properties(
 
     with pytest.raises(ValidationError):
         module.validate_report_schema(report)
+
+
+@pytest.mark.parametrize("name", ["unexpected_root_field", "api_key"])
+def test_report_schema_rejects_unknown_root_properties(name: str):
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    report[name] = "must not be accepted"
+
+    with pytest.raises(ValidationError):
+        module.validate_report_schema(report)
+
+
+@pytest.mark.parametrize(
+    ("mutation_path", "value"),
+    [
+        (("run_id",), "../escape"),
+        (("candidates", 0, "id"), "nested/candidate"),
+        (("candidates", 0, "gate", "candidate_id"), "C:\\absolute"),
+    ],
+)
+def test_report_schema_rejects_unsafe_artifact_identifiers(
+    mutation_path: tuple[Any, ...],
+    value: str,
+):
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    target: Any = report
+    for key in mutation_path[:-1]:
+        target = target[key]
+    target[mutation_path[-1]] = value
+
+    with pytest.raises(ValidationError):
+        module.validate_report_schema(report)
+
+
+@pytest.mark.parametrize(
+    "run_id",
+    ["", ".", "..", "../escape", "nested/run", "nested\\run", "/absolute", "C:\\absolute"],
+)
+def test_make_run_dir_rejects_unsafe_single_path_components(tmp_path: Path, run_id: str):
+    module = load_pipeline_module()
+
+    with pytest.raises(ValueError, match="run_id"):
+        module.make_run_dir(tmp_path, run_id)
+
+
+@pytest.mark.parametrize("candidate_id", ["..", "../escape", "nested/candidate", "nested\\candidate"])
+def test_prompt_artifacts_reject_unsafe_candidate_path_components(
+    tmp_path: Path,
+    candidate_id: str,
+):
+    module = load_pipeline_module()
+    source_prompts = module.read_source_prompts(
+        EXAMPLE_DIR / "agent" / "prompts" / "system.md",
+        EXAMPLE_DIR / "agent" / "prompts" / "router.md",
+    )
+
+    with pytest.raises(ValueError, match="candidate_id"):
+        module.write_prompt_artifacts(
+            run_dir=tmp_path,
+            candidate_id=candidate_id,
+            source_prompts=source_prompts,
+            candidate_prompts={},
+            summary="unsafe candidate",
+            source_written=False,
+        )
+
+    assert not (tmp_path.parent / "escape").exists()
 
 
 def test_router_prompt_is_instructional_not_a_gold_answer():
@@ -1119,6 +1406,31 @@ async def test_trace_mode_uses_replay_without_api_keys(tmp_path: Path, monkeypat
     assert (run_dir / "trace_metrics.json").is_file()
     trace_payload = load_report(run_dir / "trace_evalset.json")
     assert all(case["eval_mode"] == "trace" for case in trace_payload["eval_cases"])
+    assert report["artifacts"]["fixtures"].endswith("trace_outputs.json")
+
+
+@pytest.mark.asyncio
+async def test_trace_mode_consumes_trace_fixture_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = load_pipeline_module()
+    trace_fixtures = load_report(EXAMPLE_DIR / "fixtures" / "fake_outputs.json")
+    trace_marker = '{"route":"faq","tool":{"name":"none","arguments":{}},' '"reason":"TRACE FIXTURE MARKER"}'
+    trace_fixtures["candidate_local_patch"]["outputs"]["val_address_change_102"] = trace_marker
+    trace_fixture_path = tmp_path / "trace_outputs.json"
+    trace_fixture_path.write_text(json.dumps(trace_fixtures), encoding="utf-8")
+    monkeypatch.setattr(module, "TRACE_FIXTURE_PATH", trace_fixture_path, raising=False)
+
+    run_dir = await module.run_fake_or_trace(
+        mode="trace",
+        seed=7,
+        output_dir=tmp_path,
+        run_id="trace_fixture_source",
+    )
+    report = load_report(run_dir / "optimization_report.json")
+    candidate = next(item for item in report["candidates"] if item["id"] == "candidate_local_patch")
+    actual_by_id = {item["case_id"]: item["actual_text"] for item in candidate["validation"]["case_results"]}
+
+    assert report["artifacts"]["fixtures"] == str(trace_fixture_path.resolve())
+    assert actual_by_id["val_address_change_102"] == trace_marker
 
 
 @pytest.mark.asyncio
@@ -1159,6 +1471,28 @@ def test_cli_fake_mode_runs_end_to_end(tmp_path: Path):
     assert run_dir == tmp_path / "cli_fake"
     report = load_report(run_dir / "optimization_report.json")
     assert report["gate_decision"]["winner"] == "candidate_local_patch"
+
+
+def test_cli_trace_mode_defaults_to_trace_outputs(tmp_path: Path):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_PIPELINE),
+            "--mode",
+            "trace",
+            "--output-dir",
+            str(tmp_path),
+            "--run-id",
+            "cli_trace_fixture",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    run_dir = Path(proc.stdout.strip().splitlines()[-1])
+    report = load_report(run_dir / "optimization_report.json")
+
+    assert report["artifacts"]["fixtures"].endswith("trace_outputs.json")
 
 
 @pytest.mark.asyncio
@@ -1744,6 +2078,14 @@ async def test_online_mode_can_construct_optimizer_call_without_real_api(
     assert report["cost"]["optimizer"]["model_calls"] == 5
     assert report["cost"]["optimizer"]["token_usage"]["total"] == 10
     assert report["cost"]["final_revalidation"]["model_calls"] > 0
+    assert report["cost"]["token_usage"] is None
+    assert report["cost"]["token_usage_known"] is False
+    assert report["cost"]["optimizer"]["token_usage_known"] is True
+    assert report["cost"]["final_revalidation"]["token_usage"] is None
+    assert report["cost"]["final_revalidation"]["token_usage_known"] is False
+    assert report["cost"]["model_calls"] == (
+        report["cost"]["optimizer"]["model_calls"] + report["cost"]["final_revalidation"]["model_calls"]
+    )
 
 
 @pytest.mark.asyncio
@@ -2193,10 +2535,130 @@ def test_optimizer_round_audit_drops_non_string_collection_members_and_mapping_k
     assert record["optimized_field_names"] == ["system_prompt"]
     assert record["failed_case_ids"] == ["case_1"]
     assert record["metric_breakdown"] == {ROUTE_TOOL_ARGS_METRIC: 1.0}
-    assert record["token_usage"] == {"prompt": 8}
+    assert record["token_usage"] == {"prompt": 0, "completion": 0, "total": 0}
     assert record["accepted"] is False
     assert "invalid round collections" in record["decision_reason"]
     assert "mapping keys" in record["decision_reason"]
+
+
+@pytest.mark.parametrize(
+    "token_usage",
+    [
+        None,
+        {"prompt": 8},
+        {"prompt": 8, "completion": 2, "total": 9},
+        {"prompt": -1, "completion": 2, "total": 1},
+        {"prompt": 8, "completion": 2, "total": 10, "cached": 3},
+        {"prompt": float("nan"), "completion": 2, "total": 10},
+    ],
+)
+def test_optimizer_round_audit_normalizes_malformed_token_usage_to_schema_shape(
+    tmp_path: Path,
+    token_usage: Any,
+):
+    module = load_pipeline_module()
+    records = module.write_optimizer_round_artifacts(
+        run_dir=tmp_path,
+        rounds=[
+            SimpleNamespace(
+                round=1,
+                optimized_field_names=[],
+                candidate_prompts={},
+                validation_pass_rate=1.0,
+                metric_breakdown={},
+                accepted=True,
+                acceptance_reason="accepted",
+                skip_reason=None,
+                error_message=None,
+                failed_case_ids=[],
+                round_llm_cost=0.0,
+                round_token_usage=token_usage,
+                duration_seconds=0.0,
+            )
+        ],
+    )
+
+    assert records[0]["token_usage"] == {"prompt": 0, "completion": 0, "total": 0}
+    assert records[0]["accepted"] is False
+    assert "token" in records[0]["decision_reason"]
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    report["optimization_rounds"] = records
+    module.validate_report_schema(report)
+
+
+def test_online_cost_audit_distinguishes_optimizer_tokens_from_pipeline_tokens():
+    module = load_pipeline_module()
+    audit = module.online_cost_audit(
+        _optimizer_result({"prompt": 8, "completion": 2, "total": 10}),
+        final_revalidation_calls={"agent_calls": 6, "judge_model_calls": 6, "model_calls": 12},
+    )
+
+    assert audit["optimizer"]["token_usage"] == {"prompt": 8, "completion": 2, "total": 10}
+    assert audit["optimizer"]["token_usage_known"] is True
+    assert audit["final_revalidation"]["token_usage"] is None
+    assert audit["final_revalidation"]["token_usage_known"] is False
+    assert audit["token_usage"] is None
+    assert audit["token_usage_known"] is False
+    assert audit["model_calls"] == 13
+
+
+@pytest.mark.asyncio
+async def test_online_malformed_optimizer_usage_writes_rejected_schema_valid_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_pipeline_module()
+    report = await _run_stubbed_online(
+        module=module,
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        result=_optimizer_result({"prompt": "invalid", "completion": 2, "total": 2}),
+        run_id="malformed_optimizer_usage",
+    )
+
+    assert report["cost"]["optimizer"]["token_usage"] == {
+        "prompt": 0,
+        "completion": 0,
+        "total": 0,
+    }
+    assert report["cost"]["optimizer"]["token_usage_known"] is False
+    assert report["gate_decision"]["accepted"] is False
+    assert "token usage" in " ".join(report["gate_decision"]["reasons"])
+    module.validate_report_schema(report)
+
+
+@pytest.mark.asyncio
+async def test_online_duration_gate_uses_total_elapsed_and_audits_revalidation_phases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = load_pipeline_module()
+    clock = iter([0.0, 40.0, 60.0, 90.0, 91.0])
+    monkeypatch.setattr(module.time, "perf_counter", lambda: next(clock))
+    report = await _run_stubbed_online(
+        module=module,
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        result=_optimizer_result({"prompt": 8, "completion": 2, "total": 10}),
+        run_id="online_total_duration",
+        gate_config={
+            "max_duration_seconds": 80.0,
+            "required_metrics": [ROUTE_TOOL_ARGS_METRIC],
+        },
+    )
+    candidate = report["candidates"][0]
+
+    assert report["gate_decision"]["accepted"] is False
+    assert "90.00s > 80.00s" in " ".join(candidate["gate"]["reasons"])
+    assert candidate["audit"]["duration_seconds"] == 30.0
+    assert report["online_duration"] == {
+        "optimization_seconds": 40.0,
+        "baseline_revalidation_seconds": 20.0,
+        "candidate_revalidation_seconds": 30.0,
+        "gate_elapsed_seconds": 90.0,
+    }
+    assert report["duration_seconds"] == 91.0
+    module.validate_report_schema(report)
 
 
 @pytest.mark.asyncio

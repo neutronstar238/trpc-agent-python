@@ -18,7 +18,8 @@ training while regressing a critical validation case.
 
 `trace` mode materializes recorded conversations for baseline and every
 candidate, then runs the same `AgentEvaluator` summary path with
-`eval_mode="trace"`. This proves the replay path works without model inference.
+`eval_mode="trace"`. It reads `fixtures/trace_outputs.json`, independently of
+the fake-mode fixture, and proves the replay path works without model inference.
 
 `online` mode uses `AgentOptimizer.optimize(...)`, `TargetPrompt`, and
 `optimizer.json`. It first prints only whether required environment variables
@@ -55,6 +56,16 @@ The top-level report always includes `run_id`, `mode`, `seed`, `baseline`,
 writes `optimization_report.json`; schema validation failures stop report
 generation instead of producing a partial artifact.
 
+In online mode, the duration gate uses elapsed pipeline time through
+optimization, baseline revalidation, and candidate revalidation. The separate
+`online_duration` fields retain those phase durations, while each candidate's
+audit retains its own revalidation duration. Token counters under `optimizer`
+cover only optimizer-reported reflection/judge usage. Final revalidation token
+usage is `null` with `token_usage_known=false` when `AgentEvaluator` cannot
+provide it, so optimizer-only counters are never presented as total pipeline
+token usage. `model_calls` remains the sum of optimizer and final revalidation
+call counts.
+
 A compact sample output is checked in at `fixtures/optimization_report.sample.json`.
 
 ## CLI Inputs
@@ -84,9 +95,11 @@ a harmless explanation rewrite does not zero out an otherwise correct route.
 
 `environment_snapshot` records the git commit, dirty flag, Python version, SDK
 version when installed, model name, redacted base URL host, seed, command, and
-optimizer config path. It never records API keys. Known provider/runtime noise
-from DeepSeek schema downgrades and SSE decoder shutdown is isolated from the
-online smoke output.
+optimizer config path. It never records API keys. Provider/runtime warnings are
+not globally suppressed: an expected DeepSeek response-schema downgrade remains
+observable as a provider compatibility warning. SSE decoder shutdown or resource
+cleanup warnings are cleanup defects, not expected provider warnings, and should
+be investigated rather than filtered out.
 
 `optimizer_dev.evalset.json` is the optimizer-internal holdout passed to
 `AgentOptimizer.optimize(..., validation_dataset_path=...)`. `val.evalset.json`

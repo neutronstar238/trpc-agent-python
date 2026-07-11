@@ -182,12 +182,12 @@
       },
       "case_results": [
         {
-          "case_id": "train_refund_001",
+          "case_id": "dev_return_201",
           "tags": [
             "refund",
             "optimizer_dev"
           ],
-          "user": "The headphones arrived broken yesterday. I want a refund.",
+          "user": "A coffee maker delivered this morning leaks water. Please return it for a refund.",
           "score": 0.0,
           "passed": false,
           "metrics": {
@@ -206,12 +206,12 @@
               "reason": "offline rubric passed"
             }
           },
-          "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Refund policy question can be answered by FAQ.\"}",
-          "expected_text": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Broken delivered item needs refund handling.\"}",
+          "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Return policy can be answered by FAQ.\"}",
+          "expected_text": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Leaking new appliance with an explicit return request needs refund handling.\"}",
           "key_trace": {
             "invocation_id": "optimizer-dev-1",
-            "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Refund policy question can be answered by FAQ.\"}",
-            "expected_final_response": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Broken delivered item needs refund handling.\"}",
+            "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Return policy can be answered by FAQ.\"}",
+            "expected_final_response": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Leaking new appliance with an explicit return request needs refund handling.\"}",
             "error_message": null
           },
           "root_cause": "final_response_mismatch",
@@ -220,12 +220,12 @@
           ]
         },
         {
-          "case_id": "train_manual_002",
+          "case_id": "dev_access_202",
           "tags": [
             "manual",
             "optimizer_dev"
           ],
-          "user": "My account is locked and I am going to report this unless a person helps me now.",
+          "user": "Two-factor codes never arrive and I need a support specialist to restore access.",
           "score": 0.0,
           "passed": false,
           "metrics": {
@@ -244,12 +244,12 @@
               "reason": "offline rubric passed"
             }
           },
-          "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Account question can be answered by FAQ.\"}",
-          "expected_text": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Account lock with escalation demand needs a human case.\"}",
+          "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Access policy can be answered by FAQ.\"}",
+          "expected_text": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Failed two-factor delivery with a specialist request needs a human case.\"}",
           "key_trace": {
             "invocation_id": "optimizer-dev-2",
-            "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Account question can be answered by FAQ.\"}",
-            "expected_final_response": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Account lock with escalation demand needs a human case.\"}",
+            "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Access policy can be answered by FAQ.\"}",
+            "expected_final_response": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Failed two-factor delivery with a specialist request needs a human case.\"}",
             "error_message": null
           },
           "root_cause": "final_response_mismatch",
@@ -258,12 +258,12 @@
           ]
         },
         {
-          "case_id": "train_faq_003",
+          "case_id": "dev_warranty_203",
           "tags": [
             "faq",
             "optimizer_dev"
           ],
-          "user": "Can an expired coupon be reissued?",
+          "user": "How long is the warranty on a replacement charger?",
           "score": 1.0,
           "passed": true,
           "metrics": {
@@ -282,12 +282,12 @@
               "reason": "offline rubric passed"
             }
           },
-          "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
-          "expected_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
+          "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
+          "expected_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
           "key_trace": {
             "invocation_id": "optimizer-dev-3",
-            "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
-            "expected_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
+            "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
+            "expected_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
             "error_message": null
           },
           "root_cause": "",
@@ -295,8 +295,8 @@
         }
       ],
       "failed_case_ids": [
-        "train_refund_001",
-        "train_manual_002"
+        "dev_return_201",
+        "dev_access_202"
       ],
       "source": "AgentEvaluator"
     },
@@ -759,12 +759,12 @@
         },
         "case_results": [
           {
-            "case_id": "train_refund_001",
+            "case_id": "dev_return_201",
             "tags": [
               "refund",
               "optimizer_dev"
             ],
-            "user": "The headphones arrived broken yesterday. I want a refund.",
+            "user": "A coffee maker delivered this morning leaks water. Please return it for a refund.",
             "score": 1.0,
             "passed": true,
             "metrics": {
@@ -783,24 +783,24 @@
                 "reason": "offline rubric passed"
               }
             },
-            "actual_text": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Broken delivered item needs refund handling.\"}",
-            "expected_text": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Broken delivered item needs refund handling.\"}",
+            "actual_text": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Leaking new appliance with an explicit return request needs refund handling.\"}",
+            "expected_text": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Leaking new appliance with an explicit return request needs refund handling.\"}",
             "key_trace": {
               "invocation_id": "optimizer-dev-1",
-              "actual_final_response": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Broken delivered item needs refund handling.\"}",
-              "expected_final_response": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Broken delivered item needs refund handling.\"}",
+              "actual_final_response": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Leaking new appliance with an explicit return request needs refund handling.\"}",
+              "expected_final_response": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Leaking new appliance with an explicit return request needs refund handling.\"}",
               "error_message": null
             },
             "root_cause": "",
             "reasons": []
           },
           {
-            "case_id": "train_manual_002",
+            "case_id": "dev_access_202",
             "tags": [
               "manual",
               "optimizer_dev"
             ],
-            "user": "My account is locked and I am going to report this unless a person helps me now.",
+            "user": "Two-factor codes never arrive and I need a support specialist to restore access.",
             "score": 1.0,
             "passed": true,
             "metrics": {
@@ -819,24 +819,24 @@
                 "reason": "offline rubric passed"
               }
             },
-            "actual_text": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Account lock with escalation demand needs a human case.\"}",
-            "expected_text": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Account lock with escalation demand needs a human case.\"}",
+            "actual_text": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Failed two-factor delivery with a specialist request needs a human case.\"}",
+            "expected_text": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Failed two-factor delivery with a specialist request needs a human case.\"}",
             "key_trace": {
               "invocation_id": "optimizer-dev-2",
-              "actual_final_response": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Account lock with escalation demand needs a human case.\"}",
-              "expected_final_response": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Account lock with escalation demand needs a human case.\"}",
+              "actual_final_response": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Failed two-factor delivery with a specialist request needs a human case.\"}",
+              "expected_final_response": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Failed two-factor delivery with a specialist request needs a human case.\"}",
               "error_message": null
             },
             "root_cause": "",
             "reasons": []
           },
           {
-            "case_id": "train_faq_003",
+            "case_id": "dev_warranty_203",
             "tags": [
               "faq",
               "optimizer_dev"
             ],
-            "user": "Can an expired coupon be reissued?",
+            "user": "How long is the warranty on a replacement charger?",
             "score": 1.0,
             "passed": true,
             "metrics": {
@@ -855,12 +855,12 @@
                 "reason": "offline rubric passed"
               }
             },
-            "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
-            "expected_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
+            "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
+            "expected_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
             "key_trace": {
               "invocation_id": "optimizer-dev-3",
-              "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
-              "expected_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
+              "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
+              "expected_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
               "error_message": null
             },
             "root_cause": "",
@@ -1403,12 +1403,12 @@
         },
         "case_results": [
           {
-            "case_id": "train_refund_001",
+            "case_id": "dev_return_201",
             "tags": [
               "refund",
               "optimizer_dev"
             ],
-            "user": "The headphones arrived broken yesterday. I want a refund.",
+            "user": "A coffee maker delivered this morning leaks water. Please return it for a refund.",
             "score": 0.0,
             "passed": false,
             "metrics": {
@@ -1427,12 +1427,12 @@
                 "reason": "offline rubric passed"
               }
             },
-            "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Refund policy question can be answered by FAQ.\"}",
-            "expected_text": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Broken delivered item needs refund handling.\"}",
+            "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Return policy can be answered by FAQ.\"}",
+            "expected_text": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Leaking new appliance with an explicit return request needs refund handling.\"}",
             "key_trace": {
               "invocation_id": "optimizer-dev-1",
-              "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Refund policy question can be answered by FAQ.\"}",
-              "expected_final_response": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Broken delivered item needs refund handling.\"}",
+              "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Return policy can be answered by FAQ.\"}",
+              "expected_final_response": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Leaking new appliance with an explicit return request needs refund handling.\"}",
               "error_message": null
             },
             "root_cause": "final_response_mismatch",
@@ -1441,12 +1441,12 @@
             ]
           },
           {
-            "case_id": "train_manual_002",
+            "case_id": "dev_access_202",
             "tags": [
               "manual",
               "optimizer_dev"
             ],
-            "user": "My account is locked and I am going to report this unless a person helps me now.",
+            "user": "Two-factor codes never arrive and I need a support specialist to restore access.",
             "score": 0.0,
             "passed": false,
             "metrics": {
@@ -1465,12 +1465,12 @@
                 "reason": "offline rubric passed"
               }
             },
-            "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Account question can be answered by FAQ.\"}",
-            "expected_text": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Account lock with escalation demand needs a human case.\"}",
+            "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Access policy can be answered by FAQ.\"}",
+            "expected_text": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Failed two-factor delivery with a specialist request needs a human case.\"}",
             "key_trace": {
               "invocation_id": "optimizer-dev-2",
-              "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Account question can be answered by FAQ.\"}",
-              "expected_final_response": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Account lock with escalation demand needs a human case.\"}",
+              "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Access policy can be answered by FAQ.\"}",
+              "expected_final_response": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Failed two-factor delivery with a specialist request needs a human case.\"}",
               "error_message": null
             },
             "root_cause": "final_response_mismatch",
@@ -1479,12 +1479,12 @@
             ]
           },
           {
-            "case_id": "train_faq_003",
+            "case_id": "dev_warranty_203",
             "tags": [
               "faq",
               "optimizer_dev"
             ],
-            "user": "Can an expired coupon be reissued?",
+            "user": "How long is the warranty on a replacement charger?",
             "score": 1.0,
             "passed": true,
             "metrics": {
@@ -1503,12 +1503,12 @@
                 "reason": "offline rubric passed"
               }
             },
-            "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
-            "expected_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
+            "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
+            "expected_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
             "key_trace": {
               "invocation_id": "optimizer-dev-3",
-              "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
-              "expected_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
+              "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
+              "expected_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
               "error_message": null
             },
             "root_cause": "",
@@ -1516,8 +1516,8 @@
           }
         ],
         "failed_case_ids": [
-          "train_refund_001",
-          "train_manual_002"
+          "dev_return_201",
+          "dev_access_202"
         ],
         "source": "AgentEvaluator"
       },
@@ -2067,12 +2067,12 @@
         },
         "case_results": [
           {
-            "case_id": "train_refund_001",
+            "case_id": "dev_return_201",
             "tags": [
               "refund",
               "optimizer_dev"
             ],
-            "user": "The headphones arrived broken yesterday. I want a refund.",
+            "user": "A coffee maker delivered this morning leaks water. Please return it for a refund.",
             "score": 1.0,
             "passed": true,
             "metrics": {
@@ -2091,24 +2091,24 @@
                 "reason": "offline rubric passed"
               }
             },
-            "actual_text": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Broken delivered item needs refund handling.\"}",
-            "expected_text": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Broken delivered item needs refund handling.\"}",
+            "actual_text": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Leaking new appliance with an explicit return request needs refund handling.\"}",
+            "expected_text": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Leaking new appliance with an explicit return request needs refund handling.\"}",
             "key_trace": {
               "invocation_id": "optimizer-dev-1",
-              "actual_final_response": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Broken delivered item needs refund handling.\"}",
-              "expected_final_response": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Broken delivered item needs refund handling.\"}",
+              "actual_final_response": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Leaking new appliance with an explicit return request needs refund handling.\"}",
+              "expected_final_response": "{\"route\":\"refund\",\"tool\":{\"name\":\"create_refund_ticket\",\"arguments\":{}},\"reason\":\"Leaking new appliance with an explicit return request needs refund handling.\"}",
               "error_message": null
             },
             "root_cause": "",
             "reasons": []
           },
           {
-            "case_id": "train_manual_002",
+            "case_id": "dev_access_202",
             "tags": [
               "manual",
               "optimizer_dev"
             ],
-            "user": "My account is locked and I am going to report this unless a person helps me now.",
+            "user": "Two-factor codes never arrive and I need a support specialist to restore access.",
             "score": 1.0,
             "passed": true,
             "metrics": {
@@ -2127,24 +2127,24 @@
                 "reason": "offline rubric passed"
               }
             },
-            "actual_text": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Account lock with escalation demand needs a human case.\"}",
-            "expected_text": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Account lock with escalation demand needs a human case.\"}",
+            "actual_text": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Failed two-factor delivery with a specialist request needs a human case.\"}",
+            "expected_text": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Failed two-factor delivery with a specialist request needs a human case.\"}",
             "key_trace": {
               "invocation_id": "optimizer-dev-2",
-              "actual_final_response": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Account lock with escalation demand needs a human case.\"}",
-              "expected_final_response": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Account lock with escalation demand needs a human case.\"}",
+              "actual_final_response": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Failed two-factor delivery with a specialist request needs a human case.\"}",
+              "expected_final_response": "{\"route\":\"manual_escalation\",\"tool\":{\"name\":\"create_escalation_case\",\"arguments\":{}},\"reason\":\"Failed two-factor delivery with a specialist request needs a human case.\"}",
               "error_message": null
             },
             "root_cause": "",
             "reasons": []
           },
           {
-            "case_id": "train_faq_003",
+            "case_id": "dev_warranty_203",
             "tags": [
               "faq",
               "optimizer_dev"
             ],
-            "user": "Can an expired coupon be reissued?",
+            "user": "How long is the warranty on a replacement charger?",
             "score": 1.0,
             "passed": true,
             "metrics": {
@@ -2163,12 +2163,12 @@
                 "reason": "offline rubric passed"
               }
             },
-            "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
-            "expected_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
+            "actual_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
+            "expected_text": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
             "key_trace": {
               "invocation_id": "optimizer-dev-3",
-              "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
-              "expected_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Coupon policy question can be answered by FAQ.\"}",
+              "actual_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
+              "expected_final_response": "{\"route\":\"faq\",\"tool\":{\"name\":\"none\",\"arguments\":{}},\"reason\":\"Replacement charger warranty is a policy question for FAQ.\"}",
               "error_message": null
             },
             "root_cause": "",
@@ -2608,6 +2608,8 @@
       "completion": 0,
       "total": 0
     },
+    "token_usage_known": true,
+    "unknown_token_usage_reason": null,
     "optimizer": {
       "estimated_cost": 0.0,
       "model_calls": 0,
@@ -2617,13 +2619,22 @@
         "prompt": 0,
         "completion": 0,
         "total": 0
-      }
+      },
+      "token_usage_known": true,
+      "unknown_token_usage_reason": null
     },
     "final_revalidation": {
       "estimated_cost": 0.0,
       "agent_calls": 0,
       "judge_model_calls": 0,
-      "model_calls": 0
+      "model_calls": 0,
+      "token_usage": {
+        "prompt": 0,
+        "completion": 0,
+        "total": 0
+      },
+      "token_usage_known": true,
+      "unknown_token_usage_reason": null
     }
   },
   "duration_seconds": 0.0,

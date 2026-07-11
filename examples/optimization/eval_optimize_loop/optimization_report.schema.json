@@ -3,7 +3,7 @@
   "$id": "https://trpc-agent-python.local/examples/optimization/eval_optimize_loop/optimization_report.schema.json",
   "title": "Eval Optimize Loop Report",
   "type": "object",
-  "additionalProperties": true,
+  "additionalProperties": false,
   "required": [
     "run_id",
     "mode",
@@ -21,7 +21,7 @@
     "artifacts"
   ],
   "properties": {
-    "run_id": {"type": "string", "minLength": 1},
+    "run_id": {"$ref": "#/$defs/safePathComponent"},
     "mode": {"enum": ["fake", "trace", "online"]},
     "seed": {"type": "integer"},
     "baseline": {"$ref": "#/$defs/baseline"},
@@ -41,9 +41,16 @@
     },
     "config_snapshot": {"type": "object"},
     "environment_snapshot": {"$ref": "#/$defs/environmentSnapshot"},
-    "artifacts": {"type": "object", "additionalProperties": {"type": "string"}}
+    "artifacts": {"type": "object", "additionalProperties": {"type": "string"}},
+    "online_result": {"$ref": "#/$defs/onlineResult"},
+    "online_preflight": {"$ref": "#/$defs/onlinePreflight"},
+    "online_duration": {"$ref": "#/$defs/onlineDuration"}
   },
   "$defs": {
+    "safePathComponent": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?$"
+    },
     "metricSummary": {
       "type": "object",
       "additionalProperties": false,
@@ -286,7 +293,7 @@
         "validation_delta"
       ],
       "properties": {
-        "candidate_id": {"type": "string", "minLength": 1},
+        "candidate_id": {"$ref": "#/$defs/safePathComponent"},
         "accepted": {"type": "boolean"},
         "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}},
         "new_hard_fail_ids": {"type": "array", "items": {"type": "string"}},
@@ -380,25 +387,85 @@
     "optimizerCost": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["estimated_cost", "model_calls", "reflection_lm_calls", "judge_model_calls", "token_usage"],
+      "required": [
+        "estimated_cost",
+        "model_calls",
+        "reflection_lm_calls",
+        "judge_model_calls",
+        "token_usage",
+        "token_usage_known",
+        "unknown_token_usage_reason"
+      ],
       "properties": {
         "estimated_cost": {"type": ["number", "null"], "minimum": 0},
         "model_calls": {"type": "integer", "minimum": 0},
         "reflection_lm_calls": {"type": "integer", "minimum": 0},
         "judge_model_calls": {"type": "integer", "minimum": 0},
-        "token_usage": {"$ref": "#/$defs/tokenUsage"}
-      }
+        "token_usage": {"$ref": "#/$defs/tokenUsage"},
+        "token_usage_known": {"type": "boolean"},
+        "unknown_token_usage_reason": {"type": ["string", "null"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"token_usage_known": {"const": true}}},
+          "then": {"properties": {"unknown_token_usage_reason": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"token_usage_known": {"const": false}}},
+          "then": {
+            "properties": {
+              "unknown_token_usage_reason": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      ]
     },
     "finalRevalidationCost": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["estimated_cost", "agent_calls", "judge_model_calls", "model_calls"],
+      "required": [
+        "estimated_cost",
+        "agent_calls",
+        "judge_model_calls",
+        "model_calls",
+        "token_usage",
+        "token_usage_known",
+        "unknown_token_usage_reason"
+      ],
       "properties": {
         "estimated_cost": {"type": ["number", "null"], "minimum": 0},
         "agent_calls": {"type": "integer", "minimum": 0},
         "judge_model_calls": {"type": "integer", "minimum": 0},
-        "model_calls": {"type": "integer", "minimum": 0}
-      }
+        "model_calls": {"type": "integer", "minimum": 0},
+        "token_usage": {
+          "oneOf": [
+            {"$ref": "#/$defs/tokenUsage"},
+            {"type": "null"}
+          ]
+        },
+        "token_usage_known": {"type": "boolean"},
+        "unknown_token_usage_reason": {"type": ["string", "null"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"token_usage_known": {"const": true}}},
+          "then": {
+            "properties": {
+              "token_usage": {"$ref": "#/$defs/tokenUsage"},
+              "unknown_token_usage_reason": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"token_usage_known": {"const": false}}},
+          "then": {
+            "properties": {
+              "token_usage": {"type": "null"},
+              "unknown_token_usage_reason": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      ]
     },
     "cost": {
       "type": "object",
@@ -410,6 +477,8 @@
         "unknown_cost_reason",
         "model_calls",
         "token_usage",
+        "token_usage_known",
+        "unknown_token_usage_reason",
         "optimizer",
         "final_revalidation"
       ],
@@ -419,10 +488,37 @@
         "cost_source": {"type": "string", "minLength": 1},
         "unknown_cost_reason": {"type": ["string", "null"]},
         "model_calls": {"type": "integer", "minimum": 0},
-        "token_usage": {"$ref": "#/$defs/tokenUsage"},
+        "token_usage": {
+          "oneOf": [
+            {"$ref": "#/$defs/tokenUsage"},
+            {"type": "null"}
+          ]
+        },
+        "token_usage_known": {"type": "boolean"},
+        "unknown_token_usage_reason": {"type": ["string", "null"]},
         "optimizer": {"$ref": "#/$defs/optimizerCost"},
         "final_revalidation": {"$ref": "#/$defs/finalRevalidationCost"}
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"token_usage_known": {"const": true}}},
+          "then": {
+            "properties": {
+              "token_usage": {"$ref": "#/$defs/tokenUsage"},
+              "unknown_token_usage_reason": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"token_usage_known": {"const": false}}},
+          "then": {
+            "properties": {
+              "token_usage": {"type": "null"},
+              "unknown_token_usage_reason": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      ]
     },
     "optimizationRound": {
       "type": "object",
@@ -481,7 +577,7 @@
         "artifacts"
       ],
       "properties": {
-        "id": {"type": "string", "minLength": 1},
+        "id": {"$ref": "#/$defs/safePathComponent"},
         "audit": {"$ref": "#/$defs/candidateAudit"},
         "prompt_patch_summary": {"type": "string"},
         "prompt_artifacts": {"type": "array", "items": {"$ref": "#/$defs/promptArtifact"}},
@@ -498,6 +594,66 @@
         "gate": {"$ref": "#/$defs/candidateGate"},
         "failure_attribution": {"$ref": "#/$defs/failureAttribution"},
         "artifacts": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "onlineResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "error_message",
+        "baseline_pass_rate",
+        "best_pass_rate",
+        "pass_rate_improvement",
+        "stop_reason",
+        "baseline_metric_breakdown",
+        "best_metric_breakdown"
+      ],
+      "properties": {
+        "status": {"type": "string", "minLength": 1},
+        "error_message": {"type": "string"},
+        "baseline_pass_rate": {"type": "number"},
+        "best_pass_rate": {"type": "number"},
+        "pass_rate_improvement": {"type": "number"},
+        "stop_reason": {"type": ["string", "null"]},
+        "baseline_metric_breakdown": {
+          "type": "object",
+          "additionalProperties": {"type": "number"}
+        },
+        "best_metric_breakdown": {
+          "type": "object",
+          "additionalProperties": {"type": "number"}
+        }
+      }
+    },
+    "onlinePreflight": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "TRPC_AGENT_API_KEY",
+        "TRPC_AGENT_BASE_URL",
+        "TRPC_AGENT_MODEL_NAME"
+      ],
+      "properties": {
+        "TRPC_AGENT_API_KEY": {"type": "boolean"},
+        "TRPC_AGENT_BASE_URL": {"type": "boolean"},
+        "TRPC_AGENT_MODEL_NAME": {"type": "boolean"}
+      }
+    },
+    "onlineDuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "optimization_seconds",
+        "baseline_revalidation_seconds",
+        "candidate_revalidation_seconds",
+        "gate_elapsed_seconds"
+      ],
+      "properties": {
+        "optimization_seconds": {"type": "number", "minimum": 0},
+        "baseline_revalidation_seconds": {"type": "number", "minimum": 0},
+        "candidate_revalidation_seconds": {"type": "number", "minimum": 0},
+        "gate_elapsed_seconds": {"type": "number", "minimum": 0}
       }
     },
     "environmentSnapshot": {
