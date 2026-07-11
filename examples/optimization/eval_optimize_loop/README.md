@@ -13,8 +13,8 @@ python examples/optimization/eval_optimize_loop/run_pipeline.py --mode online
 
 `fake` mode evaluates deterministic fixture outputs for baseline and three
 candidates through `AgentEvaluator`. It should select `candidate_local_patch`,
-reject a no-op candidate, and reject an overfit candidate that improves training
-while regressing a critical validation case.
+reject a no-op candidate, and reject `candidate_overfit`, which improves
+training while regressing a critical validation case.
 
 `trace` mode materializes recorded conversations for baseline and every
 candidate, then runs the same `AgentEvaluator` summary path with
@@ -95,11 +95,9 @@ candidate gate scoring.
 
 ## Design Notes
 
-本示例把“评测 - 失败归因 - prompt 候选 - 验证 gate - 审计报告”做成一个可复现的最小闭环，而不是把所有逻辑塞进 `AgentOptimizer` 核心模块。原因是 SDK 已经提供 `AgentEvaluator`、`AgentOptimizer`、`TargetPrompt` 和 GEPA 产物持久化，issue 的关键缺口是把这些能力组织成一个业务可复制的 pipeline：离线时能稳定证明 gate 行为，在线时能切到真实模型和原生优化器，失败时能解释为什么拒绝候选。
+本示例把评测、归因、候选生成、验证回归和产品 gate 组织成一个可复现闭环。fake 与 trace 模式只替换 agent 输出来源，分数、逐 case pass/fail 和 metric 明细仍由 AgentEvaluator 生成，因此 CI 不依赖 API，也不会用 fixture 直接冒充分数。online 模式调用 AgentOptimizer 和 TargetPrompt，optimizer_dev 只服务优化器，val 仅参与 baseline 与最终候选复评，避免验证集答案进入 prompt 搜索。
 
-默认 `fake` 模式使用固定 fixture 输出，避免 API key、模型随机性和成本影响 CI；fixture 只作为 agent output，所有分数、pass/fail 和 metric 明细都来自 `AgentEvaluator`。它同时构造三类候选：`candidate_local_patch` 修复退款和人工升级路由且不破坏 FAQ；`candidate_noop` 没有验证集提升，因此被拒绝；`candidate_overfit` 训练集满分但把关键物流政策 case 错误升级为人工，因此被 hard-fail 和 critical-regression gate 拒绝。`trace` 模式会为 baseline 和每个 candidate 生成 `eval_mode="trace"` 数据，再调用 `AgentEvaluator` 回放，验证“不推理也能评测”的离线路径。`online` 模式只在显式选择时读取模型环境变量，把 `optimizer_dev.evalset.json` 传给原生优化器，最终再用 `val.evalset.json` 重评 baseline 和 best prompt；顶层报告基于原生 `OptimizeResult` 以及 best prompt 的重新验证结果生成。
-
-报告采用 JSON 优先：机器读取 `optimization_report.json` 做 gate、审计和 CI 判断；人读 `optimization_report.md` 只看 baseline、winner、case delta、失败归因和接受/拒绝理由。成本审计会区分 optimizer 调用和最终重评调用；如果供应商价格未知，报告不会把未知成本写成 0 并通过成本预算。所有运行时产物只写入 `runs/` 或调用方指定的输出目录，避免污染源 prompt 和示例数据。
+报告先写 JSON，再渲染 Markdown。每个候选保存 prompt 摘要与哈希、训练和验证结果、逐 case 变化、失败原因、gate 检查、成本和耗时。gate 要求验证分数严格超过阈值，且不得新增 hard fail、关键 case 退化、必需 metric 失败或预算越界；成本未知且配置了成本上限时按失败处理。候选只写入运行目录，原始 prompt 不会被覆盖，随机种子、配置哈希和环境快照用于复现实验。
 
 ## Verification
 

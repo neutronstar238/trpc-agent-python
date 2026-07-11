@@ -662,6 +662,78 @@ def test_readme_includes_design_notes_and_sample_report_shape():
     }
 
 
+def test_public_candidates_cover_success_noop_and_aggregate_regression(tmp_path: Path):
+    module = load_pipeline_module()
+    report = module.make_report(
+        mode="fake",
+        run_id="public_scenarios",
+        run_dir=tmp_path,
+        seed=7,
+        started=module.time.perf_counter(),
+    )
+    candidates = {item["id"]: item for item in report["candidates"]}
+    assert candidates["candidate_local_patch"]["gate"]["accepted"] is True
+    assert candidates["candidate_noop"]["delta"]["validation_score"] == 0
+    assert candidates["candidate_noop"]["gate"]["accepted"] is False
+    overfit = candidates["candidate_overfit"]
+    assert overfit["delta"]["train_score"] > 0
+    assert overfit["delta"]["validation_score"] < 0
+    assert overfit["gate"]["accepted"] is False
+
+
+def test_design_notes_length_is_within_issue_limit():
+    readme = (EXAMPLE_DIR / "README.md").read_text(encoding="utf-8")
+    section = readme.split("## Design Notes", 1)[1].split("## Verification", 1)[0]
+    non_whitespace = len("".join(section.split()))
+    assert 300 <= non_whitespace <= 500
+
+
+def test_sample_report_is_deterministic_and_has_no_temporary_paths():
+    sample = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    assert sample["run_id"] == "sample"
+    stable_environment = {
+        "git_commit": "sample",
+        "git_dirty": False,
+        "python_version": "3.x",
+        "sdk_version": "sample",
+        "model_name": None,
+        "base_url_host": None,
+        "command": (
+            "python examples/optimization/eval_optimize_loop/run_pipeline.py "
+            "--mode fake --output-dir runs --run-id sample"
+        ),
+        "config_path": "examples/optimization/eval_optimize_loop/optimizer.json",
+    }
+    for key, value in stable_environment.items():
+        assert sample["environment_snapshot"][key] == value
+
+    durations: list[Any] = []
+    strings: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "duration_seconds":
+                    durations.append(item)
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+        elif isinstance(value, str):
+            strings.append(value)
+
+    collect(sample)
+    assert durations
+    assert all(value == 0.0 for value in durations)
+    assert all("\\" not in value for value in strings)
+    assert all(not (len(value) >= 3 and value[1:3] == ":/") for value in strings)
+    normalized_bytes = (EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json").read_bytes().replace(
+        b"\r\n", b"\n"
+    )
+    assert normalized_bytes.endswith(b"\n")
+    assert not normalized_bytes.endswith(b"\n\n")
+
+
 def test_sample_report_validates_against_schema_and_required_fields_are_enforced():
     module = load_pipeline_module()
     sample = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
