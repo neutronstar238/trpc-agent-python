@@ -448,6 +448,38 @@ def test_load_gate_config_rejects_non_mapping_sources(tmp_path: Path, payload: A
         module.load_gate_config(overrides=payload)
 
 
+def test_unknown_gate_keys_fail_closed_for_files_overrides_and_direct_calls(tmp_path: Path):
+    module = load_pipeline_module()
+    typo_gate = {"min_validaton_delta": 0.9}
+    gate_path = tmp_path / "gate.json"
+    gate_path.write_text(json.dumps(typo_gate), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unknown gate config"):
+        module.load_gate_config(gate_path)
+    with pytest.raises(ValueError, match="unknown gate config"):
+        module.load_gate_config(overrides=typo_gate)
+
+    result = module.apply_gate(
+        candidate_id="typo_gate",
+        baseline_val=_gate_summary(
+            0.25,
+            [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}],
+        ),
+        candidate_val=_gate_summary(
+            0.75,
+            [{"case_id": "a", "score": 0.75, "passed": True, "tags": []}],
+        ),
+        gate_config={
+            **typo_gate,
+            "required_metrics": [ROUTE_TOOL_ARGS_METRIC],
+        },
+        duration_seconds=1.0,
+        cost_usd=0.0,
+    )
+    assert result["accepted"] is False
+    assert "unknown gate config" in " ".join(result["reasons"])
+
+
 def test_apply_gate_rejects_summary_score_not_derived_from_cases():
     module = load_pipeline_module()
     baseline_cases = [{"case_id": "a", "score": 0.25, "passed": True, "tags": []}]
@@ -1228,6 +1260,20 @@ def test_validate_inputs_canonicalizes_structurally_equal_json_gold(tmp_path: Pa
         module.validate_inputs(train, optimizer_dev, validation)
 
 
+def test_validate_inputs_uses_json_criterion_numeric_tolerance(tmp_path: Path):
+    module = load_pipeline_module()
+    train, optimizer_dev, validation = _copy_public_evalsets(tmp_path)
+    train_payload = load_report(train)
+    dev_payload = load_report(optimizer_dev)
+    train_payload["eval_cases"][0]["conversation"][0]["final_response"]["parts"] = [{"text": '{"x":1.0}'}]
+    dev_payload["eval_cases"][0]["conversation"][0]["final_response"]["parts"] = [{"text": '{"x":1.0000005}'}]
+    train.write_text(json.dumps(train_payload), encoding="utf-8")
+    optimizer_dev.write_text(json.dumps(dev_payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="gold"):
+        module.validate_inputs(train, optimizer_dev, validation)
+
+
 def test_directory_layout_and_assets_exist():
     expected = {
         "README.md",
@@ -1678,7 +1724,7 @@ def test_report_semantics_recompute_critical_regression_gate_evidence():
     candidate["case_deltas"] = module.build_case_deltas(report["baseline"]["validation"], validation)
     report["delta"] = copy.deepcopy(candidate["delta"])
 
-    with pytest.raises(ValidationError, match="gate evidence"):
+    with pytest.raises(ValidationError, match="gate evidence|primary metric"):
         module.validate_report_schema(report)
 
 
@@ -1707,12 +1753,86 @@ def test_report_semantics_recompute_aggregate_metrics_from_case_metrics():
         module.validate_report_schema(report)
 
 
+@pytest.mark.parametrize("mutation", ["omitted", "contradictory"])
+def test_report_semantics_require_complete_consistent_case_metrics(mutation: str):
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    candidate = next(item for item in report["candidates"] if item["gate"]["accepted"])
+    case_metric = candidate["validation"]["case_results"][0]["metrics"][ROUTE_TOOL_ARGS_METRIC]
+    if mutation == "omitted":
+        del candidate["validation"]["case_results"][0]["metrics"][ROUTE_TOOL_ARGS_METRIC]
+    else:
+        case_metric.update({"passed": False, "status": "failed"})
+    candidate["final_validation"] = copy.deepcopy(candidate["validation"])
+
+    with pytest.raises(ValidationError, match="case metric|metric coverage"):
+        module.validate_report_schema(report)
+
+
+def test_sample_report_records_hashed_normalized_evaluation_config():
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    snapshot = report["config_snapshot"]
+
+    assert snapshot["evaluation"]
+    assert snapshot["evaluation_sha256"] == module.sha256_json(snapshot["evaluation"])
+    snapshot["evaluation"]["num_runs"] = 2
+    with pytest.raises(ValidationError, match="evaluation config hash"):
+        module.validate_report_schema(report)
+
+
 def test_report_semantics_reconcile_candidate_audit_cost_with_pipeline_cost():
     module = load_pipeline_module()
     report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
     report["candidates"][0]["audit"]["cost"]["estimated"] = 0.5
 
     with pytest.raises(ValidationError, match="candidate audit cost"):
+        module.validate_report_schema(report)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "environment_seed",
+        "candidate_config_hash",
+        "environment_extra_secret",
+        "config_extra_secret",
+        "duplicate_round",
+        "round_prompt_hash_keys",
+    ],
+)
+def test_report_semantics_bind_reproducibility_audit_fields(mutation: str):
+    module = load_pipeline_module()
+    report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
+    round_record = {
+        "round": 1,
+        "optimized_field_names": [],
+        "prompt_paths": {"system_prompt": "runs/sample/system.md"},
+        "prompt_sha256": {"system_prompt": "0" * 64},
+        "validation_pass_rate": 0.0,
+        "metric_breakdown": {},
+        "accepted": False,
+        "decision_reason": "audit fixture",
+        "failed_case_ids": [],
+        "cost_usd": 0.0,
+        "token_usage": {"prompt": 0, "completion": 0, "total": 0},
+        "duration_seconds": 0.0,
+    }
+    if mutation == "environment_seed":
+        report["environment_snapshot"]["seed"] = 999
+    elif mutation == "candidate_config_hash":
+        report["candidates"][0]["audit"]["config_sha256"] = "0" * 64
+    elif mutation == "environment_extra_secret":
+        report["environment_snapshot"]["api_key"] = "must-not-be-accepted"
+    elif mutation == "config_extra_secret":
+        report["config_snapshot"]["api_key"] = "must-not-be-accepted"
+    elif mutation == "duplicate_round":
+        report["optimization_rounds"] = [copy.deepcopy(round_record), copy.deepcopy(round_record)]
+    else:
+        round_record["prompt_sha256"] = {}
+        report["optimization_rounds"] = [round_record]
+
+    with pytest.raises(ValidationError):
         module.validate_report_schema(report)
 
 
@@ -1910,11 +2030,15 @@ def test_report_schema_requires_consistent_optimizer_token_accounting(
 def test_report_schema_allows_empty_no_run_case_metrics():
     module = load_pipeline_module()
     report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
-    report["baseline"]["validation"]["case_results"][0]["metrics"] = {}
-    report["baseline"]["final_validation"]["case_results"][0]["metrics"] = {}
     for summary_name in ("validation", "final_validation"):
+        case = report["baseline"][summary_name]["case_results"][0]
+        case["metrics"] = {}
+        case["key_trace"]["error_message"] = "AgentEvaluator returned no run for case"
+        case["root_cause"] = "runtime_error"
+        case["reasons"] = ["evaluation runtime error: AgentEvaluator returned no run for case"]
         metric = report["baseline"][summary_name]["metrics"][ROUTE_TOOL_ARGS_METRIC]
         metric.update({"score": 1.0, "passed": True, "status": "passed"})
+    report["failure_attribution"] = module.attribution_for(report["baseline"]["validation"])
 
     module.validate_report_schema(report)
 
@@ -3013,9 +3137,11 @@ async def test_online_mode_can_construct_optimizer_call_without_real_api(
 
     monkeypatch.setattr(evaluation_pkg.AgentOptimizer, "optimize", staticmethod(fake_optimize))
     patch_agent_evaluator(monkeypatch)
-    run_dir = await module.run_online(seed=7, output_dir=tmp_path, run_id="online_wiring")
+    run_dir = await module.run_online(seed=42, output_dir=tmp_path, run_id="online_wiring")
 
     assert captured["config_path"].endswith("optimizer.json")
+    captured_config = load_report(Path(captured["config_path"]))
+    assert captured_config["optimize"]["algorithm"]["seed"] == 42
     assert captured["train_dataset_path"].endswith("train.evalset.json")
     assert captured["validation_dataset_path"].endswith("optimizer_dev.evalset.json")
     assert not captured["validation_dataset_path"].endswith("val.evalset.json")
@@ -3027,7 +3153,7 @@ async def test_online_mode_can_construct_optimizer_call_without_real_api(
     assert report["artifacts"]["optimizer_dev_evalset"].endswith("optimizer_dev.evalset.json")
     assert report["artifacts"]["final_validation_evalset"].endswith("val.evalset.json")
     assert report["optimization_rounds"] == []
-    _assert_candidate_audit(report["candidates"][0], 7)
+    _assert_candidate_audit(report["candidates"][0], 42)
     for name, value in report["artifacts"].items():
         if name.startswith("native_") and value:
             assert Path(value).exists(), name
@@ -3676,6 +3802,7 @@ def test_judge_call_accounting_includes_each_model_sample_and_eval_run():
     assert module.judge_calls_per_agent_call(metrics_config) == 5
     final = module.final_revalidation_call_audit([summary], metrics_config)
     assert final == {
+        "agent_calls_per_run": 2,
         "agent_calls": 4,
         "judge_calls_per_agent_call": 5,
         "judge_model_calls": 20,
@@ -3692,6 +3819,54 @@ def test_judge_call_accounting_includes_each_model_sample_and_eval_run():
     assert audit["optimizer"]["judge_model_calls"] == 10
 
 
+def test_final_revalidation_call_audit_counts_every_conversation_turn():
+    module = load_pipeline_module()
+    metrics_config = {
+        "metrics": [
+            {
+                "metric_name": "llm_multi_judge",
+                "threshold": 0.5,
+                "criterion": {
+                    "llm_judge": {
+                        "judge_models": [
+                            {"model_name": "judge-a", "num_samples": 2},
+                            {"model_name": "judge-b", "num_samples": 3},
+                        ]
+                    }
+                },
+            }
+        ],
+        "num_runs": 1,
+    }
+    summaries = [{"case_results": [{"case_id": "a"}]}]
+    evalset_payloads = [
+        {
+            "eval_cases": [
+                {
+                    "eval_id": "a",
+                    "conversation": [
+                        {"user_content": {}, "final_response": {}},
+                        {"user_content": {}, "final_response": {}},
+                    ],
+                }
+            ]
+        }
+    ]
+
+    audit = module.final_revalidation_call_audit(
+        summaries,
+        metrics_config,
+        evalset_payloads=evalset_payloads,
+    )
+    assert audit == {
+        "agent_calls_per_run": 2,
+        "agent_calls": 2,
+        "judge_calls_per_agent_call": 5,
+        "judge_model_calls": 10,
+        "model_calls": 12,
+    }
+
+
 def test_report_semantics_recompute_derived_judge_calls_from_recorded_multiplier():
     module = load_pipeline_module()
     report = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
@@ -3699,7 +3874,7 @@ def test_report_semantics_recompute_derived_judge_calls_from_recorded_multiplier
     optimizer["candidate_evaluation_agent_calls"] = 2
     optimizer["judge_calls_per_candidate_evaluation"] = 2
 
-    with pytest.raises(ValidationError, match="derived judge"):
+    with pytest.raises(ValidationError, match="derived judge|offline reports"):
         module.validate_report_schema(report)
 
 

@@ -39,7 +39,7 @@
       "type": "array",
       "items": {"$ref": "#/$defs/optimizationRound"}
     },
-    "config_snapshot": {"type": "object"},
+    "config_snapshot": {"$ref": "#/$defs/configSnapshot"},
     "environment_snapshot": {"$ref": "#/$defs/environmentSnapshot"},
     "artifacts": {"type": "object", "additionalProperties": {"type": "string"}},
     "online_result": {"$ref": "#/$defs/onlineResult"},
@@ -507,6 +507,7 @@
       "additionalProperties": false,
       "required": [
         "estimated_cost",
+        "agent_calls_per_run",
         "agent_calls",
         "judge_calls_per_agent_call",
         "judge_model_calls",
@@ -517,6 +518,7 @@
       ],
       "properties": {
         "estimated_cost": {"type": ["number", "null"], "minimum": 0},
+        "agent_calls_per_run": {"type": "integer", "minimum": 0},
         "agent_calls": {"type": "integer", "minimum": 0},
         "judge_calls_per_agent_call": {"type": "integer", "minimum": 0},
         "judge_model_calls": {"type": "integer", "minimum": 0},
@@ -740,9 +742,53 @@
         "gate_elapsed_seconds": {"type": "number", "minimum": 0}
       }
     },
+    "configSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "seed",
+        "gate",
+        "evaluation",
+        "evaluation_sha256",
+        "paths"
+      ],
+      "properties": {
+        "mode": {"enum": ["fake", "trace", "online"]},
+        "seed": {"type": "integer"},
+        "gate": {"type": "object"},
+        "evaluation": {"type": "object"},
+        "evaluation_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "paths": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "train_evalset",
+            "optimizer_dev_evalset",
+            "validation_evalset",
+            "final_validation_evalset",
+            "optimizer_config",
+            "system_prompt",
+            "router_prompt"
+          ],
+          "properties": {
+            "train_evalset": {"type": "string", "minLength": 1},
+            "optimizer_dev_evalset": {"type": "string", "minLength": 1},
+            "validation_evalset": {"type": "string", "minLength": 1},
+            "final_validation_evalset": {"type": "string", "minLength": 1},
+            "optimizer_config": {"type": "string", "minLength": 1},
+            "optimizer_source_config": {"type": "string", "minLength": 1},
+            "fixture_outputs": {"type": "string", "minLength": 1},
+            "online_eval_metrics": {"type": "string", "minLength": 1},
+            "system_prompt": {"type": "string", "minLength": 1},
+            "router_prompt": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
     "environmentSnapshot": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
       "required": [
         "git_commit",
         "git_dirty",

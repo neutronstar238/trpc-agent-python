@@ -2641,6 +2641,7 @@
     },
     "final_revalidation": {
       "estimated_cost": 0.0,
+      "agent_calls_per_run": 0,
       "agent_calls": 0,
       "judge_calls_per_agent_call": 0,
       "judge_model_calls": 0,
@@ -2671,6 +2672,36 @@
       ],
       "required_metrics_source": "optimizer_config"
     },
+    "evaluation": {
+      "metrics": [
+        {
+          "metric_name": "route_tool_args_score",
+          "threshold": 1.0,
+          "criterion": {
+            "final_response": {
+              "json": {
+                "match": "exact"
+              }
+            }
+          }
+        },
+        {
+          "metric_name": "llm_rubric_response",
+          "threshold": 1.0,
+          "criterion": {
+            "offline_rubric": {
+              "checks": [
+                "valid_json_object",
+                "route_present",
+                "tool_object_present"
+              ]
+            }
+          }
+        }
+      ],
+      "num_runs": 1
+    },
+    "evaluation_sha256": "a2a1ec7e174d243b397ee7875d7528cb198d1c1d3fbce9dc82f8cb85e33fe166",
     "paths": {
       "train_evalset": "examples/optimization/eval_optimize_loop/train.evalset.json",
       "optimizer_dev_evalset": "examples/optimization/eval_optimize_loop/optimizer_dev.evalset.json",

@@ -102,6 +102,8 @@ DEFAULT_GATE_CONFIG = {
     "max_duration_seconds": DEFAULT_MAX_SECONDS,
     "required_metrics": [PRIMARY_METRIC],
 }
+GATE_CONFIG_KEYS = frozenset(DEFAULT_GATE_CONFIG)
+GATE_RUNTIME_KEYS = GATE_CONFIG_KEYS | {"required_metrics_source"}
 
 SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?$")
 TOKEN_USAGE_KEYS = ("prompt", "completion", "total")
@@ -113,6 +115,7 @@ WINDOWS_RESERVED_BASENAMES = {
     *(f"com{number}" for number in range(1, 10)),
     *(f"lpt{number}" for number in range(1, 10)),
 }
+INVALID_JSON_EVIDENCE = object()
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -168,6 +171,37 @@ def validate_report_schema(report: dict[str, Any]) -> None:
             reject(f"{label} summary failed_case_ids do not match case results")
         if summary["source"] != "AgentEvaluator":
             reject(f"{label} summary source must be AgentEvaluator")
+        numeric_case_metric_names: set[str] = set()
+        explicit_no_run_case_ids: set[str] = set()
+        for case in case_results:
+            case_metrics = case["metrics"]
+            if not case_metrics:
+                if not case["passed"] and case["key_trace"]["error_message"]:
+                    explicit_no_run_case_ids.add(case["case_id"])
+                    continue
+                reject(f"{label} case metric evidence is empty without an explicit failed run")
+            for metric_name, metric in case_metrics.items():
+                metric_score = _finite_float(metric["score"])
+                metric_threshold = _finite_float(metric["threshold"])
+                if metric_threshold is None:
+                    reject(f"{label} case metric {metric_name} has an invalid threshold")
+                if metric_score is None:
+                    if metric["passed"] or metric["status"].lower() == "passed":
+                        reject(f"{label} case metric {metric_name} has contradictory missing-score evidence")
+                    continue
+                numeric_case_metric_names.add(metric_name)
+                expected_passed = metric_score >= metric_threshold
+                expected_status = "passed" if expected_passed else "failed"
+                if metric["passed"] is not expected_passed or metric["status"].lower() != expected_status:
+                    reject(f"{label} case metric {metric_name} has contradictory score evidence")
+            if case["passed"] and any(metric["passed"] is not True for metric in case_metrics.values()):
+                reject(f"{label} passed case contains failed metric evidence")
+            primary_metric = case_metrics.get(PRIMARY_METRIC)
+            if isinstance(primary_metric, Mapping) and _finite_float(primary_metric.get("score")) is not None:
+                if round(case["score"], 6) != round(float(primary_metric["score"]), 6):
+                    reject(f"{label} case score does not match the primary metric")
+        if set(summary["metrics"]) != numeric_case_metric_names:
+            reject(f"{label} metric coverage does not match numeric case metric evidence")
         for metric_name, metric in summary["metrics"].items():
             metric_score = _finite_float(metric["score"])
             metric_threshold = _finite_float(metric["threshold"])
@@ -181,7 +215,9 @@ def validate_report_schema(report: dict[str, Any]) -> None:
             for case in case_results:
                 case_metric = case["metrics"].get(metric_name)
                 if not isinstance(case_metric, Mapping):
-                    continue
+                    if case["case_id"] in explicit_no_run_case_ids:
+                        continue
+                    reject(f"{label} metric coverage is missing {metric_name} for an executed case")
                 case_metric_score = _finite_float(case_metric.get("score"))
                 if case_metric_score is None:
                     continue
@@ -220,9 +256,35 @@ def validate_report_schema(report: dict[str, Any]) -> None:
         reject("top-level failure attribution does not match baseline validation failures")
 
     config_snapshot = report["config_snapshot"]
+    if config_snapshot["mode"] != report["mode"] or config_snapshot["seed"] != report["seed"]:
+        reject("config snapshot mode and seed must match the report")
     recorded_gate_config = config_snapshot.get("gate")
     if not isinstance(recorded_gate_config, Mapping):
         reject("config_snapshot.gate must be an object")
+    evaluation_snapshot = config_snapshot["evaluation"]
+    try:
+        renormalized_evaluation = normalized_evaluation_config(evaluation_snapshot)
+    except ValueError as error:
+        reject(f"config snapshot evaluation is invalid: {error}")
+    if renormalized_evaluation != evaluation_snapshot:
+        reject("config snapshot evaluation must be normalized and credential-free")
+    if config_snapshot["evaluation_sha256"] != sha256_json(evaluation_snapshot):
+        reject("evaluation config hash does not match the normalized snapshot")
+    expected_judge_multiplier = judge_calls_per_agent_call(evaluation_snapshot)
+    config_paths = config_snapshot["paths"]
+    expected_optimizer_config_path = config_paths["optimizer_config"]
+    environment = report["environment_snapshot"]
+    if environment["seed"] != report["seed"]:
+        reject("environment snapshot seed must match the report")
+    if environment["config_path"] != expected_optimizer_config_path:
+        reject("environment config path must match the config snapshot")
+
+    round_ids = [round_record["round"] for round_record in report["optimization_rounds"]]
+    if len(round_ids) != len(set(round_ids)):
+        reject("optimization round identifiers must be unique")
+    for round_record in report["optimization_rounds"]:
+        if set(round_record["prompt_paths"]) != set(round_record["prompt_sha256"]):
+            reject("optimization round prompt path and hash keys must match")
     cost = report["cost"]
     if report["mode"] == "online":
         online_duration = report.get("online_duration")
@@ -287,6 +349,18 @@ def validate_report_schema(report: dict[str, Any]) -> None:
         candidate_audit = candidate["audit"]
         if candidate_audit["seed"] != report["seed"]:
             reject(f"candidate audit seed does not match report seed: {candidate_id}")
+        if candidate_audit["config_path"] != expected_optimizer_config_path:
+            reject(f"candidate audit config path does not match config snapshot: {candidate_id}")
+        audit_config_path = Path(candidate_audit["config_path"])
+        if not audit_config_path.is_absolute():
+            audit_config_path = REPO_ROOT / audit_config_path
+        if audit_config_path.is_file() and candidate_audit["config_sha256"] != sha256_file(audit_config_path):
+            reject(f"candidate audit config hash does not match config artifact: {candidate_id}")
+        prompt_artifact_names = [artifact["name"] for artifact in candidate["prompt_artifacts"]]
+        if len(prompt_artifact_names) != len(set(prompt_artifact_names)):
+            reject(f"candidate prompt artifact names must be unique: {candidate_id}")
+        if any(artifact["source_written"] for artifact in candidate["prompt_artifacts"]):
+            reject(f"candidate prompt audit must not claim source writes: {candidate_id}")
         pipeline_cost = cost["estimated_total"]
         audit_cost = candidate_audit["cost"]
         if audit_cost["known"] is not (pipeline_cost is not None) or audit_cost["estimated"] != pipeline_cost:
@@ -354,6 +428,30 @@ def validate_report_schema(report: dict[str, Any]) -> None:
         reject("top-level delta does not match recomputed winner delta")
 
     optimizer_cost = cost["optimizer"]
+    final_cost = cost["final_revalidation"]
+    if report["mode"] == "online":
+        if optimizer_cost["judge_calls_per_candidate_evaluation"] != expected_judge_multiplier:
+            reject("optimizer judge multiplier does not match the recorded evaluation config")
+        if final_cost["judge_calls_per_agent_call"] != expected_judge_multiplier:
+            reject("final judge multiplier does not match the recorded evaluation config")
+    else:
+        offline_call_evidence = (
+            optimizer_cost["model_calls"],
+            optimizer_cost["candidate_evaluation_agent_calls"],
+            optimizer_cost["reflection_lm_calls"],
+            optimizer_cost["judge_calls_per_candidate_evaluation"],
+            optimizer_cost["judge_model_calls"],
+            optimizer_cost["native_judge_model_calls"],
+            optimizer_cost["derived_judge_model_calls"],
+            final_cost["agent_calls_per_run"],
+            final_cost["agent_calls"],
+            final_cost["judge_calls_per_agent_call"],
+            final_cost["judge_model_calls"],
+            final_cost["model_calls"],
+            cost["model_calls"],
+        )
+        if any(offline_call_evidence):
+            reject("offline reports must record zero optimizer and provider model calls")
     native_judge_calls = optimizer_cost["native_judge_model_calls"]
     derived_judge_calls = optimizer_cost["derived_judge_model_calls"]
     expected_derived_judge_calls = (
@@ -385,7 +483,9 @@ def validate_report_schema(report: dict[str, Any]) -> None:
     )
     if optimizer_cost["model_calls"] != expected_optimizer_calls:
         reject("optimizer model_calls must equal candidate, reflection, and judge calls")
-    final_cost = cost["final_revalidation"]
+    expected_final_agent_calls = final_cost["agent_calls_per_run"] * evaluation_snapshot["num_runs"]
+    if final_cost["agent_calls"] != expected_final_agent_calls:
+        reject("final revalidation agent calls do not match per-run calls and evaluation num_runs")
     expected_final_judge_calls = final_cost["agent_calls"] * final_cost["judge_calls_per_agent_call"]
     if final_cost["judge_model_calls"] != expected_final_judge_calls:
         reject("final revalidation judge calls do not match agent calls and recorded multiplier")
@@ -498,8 +598,70 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def sha256_json(value: Any) -> str:
+    canonical = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return sha256_text(canonical)
+
+
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _redact_evaluation_config(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized_key in {
+                "apikey",
+                "authorization",
+                "proxyauthorization",
+                "baseurl",
+                "headers",
+                "cookies",
+                "accesstoken",
+                "sessiontoken",
+            }:
+                continue
+            redacted[str(key)] = _redact_evaluation_config(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_evaluation_config(item) for item in value]
+    return value
+
+
+def normalized_evaluation_config(metrics_config: Mapping[str, Any]) -> dict[str, Any]:
+    from trpc_agent_sdk.evaluation._eval_config import EvalConfig
+
+    try:
+        eval_config = EvalConfig.model_validate(dict(metrics_config))
+    except Exception as error:
+        raise ValueError(f"invalid evaluation metrics config: {error}") from error
+    metrics = []
+    for metric in eval_config.get_eval_metrics():
+        metrics.append(
+            {
+                "metric_name": metric.metric_name,
+                "threshold": float(metric.threshold),
+                "criterion": _redact_evaluation_config(copy.deepcopy(metric.criterion)),
+            }
+        )
+    snapshot: dict[str, Any] = {
+        "metrics": metrics,
+        "num_runs": eval_config.num_runs,
+    }
+    if eval_config.user_simulator_config is not None:
+        user_simulator = eval_config.user_simulator_config
+        if hasattr(user_simulator, "model_dump"):
+            user_simulator = user_simulator.model_dump(mode="json")
+        snapshot["user_simulator_config"] = _redact_evaluation_config(user_simulator)
+    return snapshot
 
 
 def build_candidate_audit(
@@ -899,6 +1061,32 @@ def validated_optimizer_evaluate_config(config_path: Path) -> dict[str, Any]:
     return payload["evaluate"]
 
 
+def materialize_optimizer_config(
+    *,
+    run_dir: Path,
+    source_config: Path,
+    seed: int,
+) -> Path:
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("optimizer seed must be an integer")
+    validated_optimizer_evaluate_config(source_config)
+    payload = load_json(source_config)
+    optimize = payload.get("optimize") if isinstance(payload, dict) else None
+    algorithm = optimize.get("algorithm") if isinstance(optimize, dict) else None
+    if not isinstance(algorithm, dict):
+        raise ValueError("optimizer optimize.algorithm must be an object")
+    runtime_payload = copy.deepcopy(payload)
+    runtime_payload["optimize"]["algorithm"]["seed"] = seed
+    runtime_path = _resolved_run_descendant(
+        run_dir,
+        "optimizer.json",
+        label="runtime optimizer config artifact",
+    )
+    write_json(runtime_path, runtime_payload)
+    validated_optimizer_evaluate_config(runtime_path)
+    return runtime_path
+
+
 def online_preflight() -> dict[str, bool]:
     return {name: bool(os.getenv(name)) for name in ONLINE_ENV_VARS}
 
@@ -937,11 +1125,11 @@ def final_text_from_content(content: Any) -> str:
     ).strip()
 
 
-def canonical_gold_evidence(content: Any) -> str:
+def parsed_json_evidence(content: Any) -> Any:
     visible_text = final_text_from_content(content)
     try:
         parsed = json.loads(visible_text)
-        canonical = json.dumps(
+        json.dumps(
             parsed,
             sort_keys=True,
             separators=(",", ":"),
@@ -949,8 +1137,22 @@ def canonical_gold_evidence(content: Any) -> str:
             allow_nan=False,
         )
     except (TypeError, ValueError, json.JSONDecodeError):
+        return INVALID_JSON_EVIDENCE
+    return parsed
+
+
+def canonical_gold_evidence(content: Any) -> str:
+    visible_text = final_text_from_content(content)
+    parsed = parsed_json_evidence(content)
+    if parsed is INVALID_JSON_EVIDENCE:
         return "text:" + " ".join(visible_text.split())
-    return "json:" + canonical
+    return "json:" + json.dumps(
+        parsed,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
 
 
 _SENSITIVE_REPORT_TEXT = re.compile(
@@ -1020,13 +1222,20 @@ def load_gate_config(
         if not isinstance(raw_path_payload, Mapping):
             raise ValueError("gate config must be a JSON object")
         path_payload = dict(raw_path_payload)
+        unknown_keys = sorted(str(key) for key in set(path_payload) - GATE_CONFIG_KEYS)
+        if unknown_keys:
+            raise ValueError("unknown gate config field(s): " + ", ".join(unknown_keys))
         config.update(path_payload)
         if "required_metrics" in path_payload:
             required_source = "gate_config"
     if overrides is not None:
         if not isinstance(overrides, Mapping):
             raise ValueError("gate config overrides must be a mapping")
-        config.update(dict(overrides))
+        override_payload = dict(overrides)
+        unknown_keys = sorted(str(key) for key in set(override_payload) - GATE_CONFIG_KEYS)
+        if unknown_keys:
+            raise ValueError("unknown gate config override field(s): " + ", ".join(unknown_keys))
+        config.update(override_payload)
         if "required_metrics" in overrides:
             required_source = "override"
     if optimizer_config is not None and required_source == "default":
@@ -1059,7 +1268,7 @@ def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalse
         if sha256_file(left) == sha256_file(right):
             raise ValueError(f"{left_role} and {right_role} evalsets are byte-identical copies")
 
-    evidence: dict[str, dict[str, set[str]]] = {}
+    evidence: dict[str, dict[str, Any]] = {}
     for role, path in paths.items():
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1069,7 +1278,7 @@ def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalse
             raise ValueError(f"{role} evalset must be an object with an eval_cases array")
         if not payload["eval_cases"]:
             raise ValueError(f"{role} evalset eval_cases must not be empty")
-        role_evidence = {"id": set(), "input": set(), "gold": set()}
+        role_evidence = {"id": set(), "input": set(), "gold": set(), "json_gold": []}
         for position, case in enumerate(payload["eval_cases"]):
             prefix = f"{role} evalset eval_cases[{position}]"
             if not isinstance(case, dict):
@@ -1111,6 +1320,9 @@ def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalse
                     raise ValueError(f"{invocation_prefix} visible final response must be non-empty")
                 role_evidence["input"].add(normalized_input)
                 role_evidence["gold"].add(canonical_gold_evidence(final_response))
+                parsed_gold = parsed_json_evidence(final_response)
+                if parsed_gold is not INVALID_JSON_EVIDENCE:
+                    role_evidence["json_gold"].append(parsed_gold)
         evidence[role] = role_evidence
 
     for left_role, right_role in role_pairs:
@@ -1118,6 +1330,15 @@ def validate_inputs(train_evalset: Path, optimizer_dev_evalset: Path, val_evalse
             overlap = evidence[left_role][evidence_type] & evidence[right_role][evidence_type]
             if overlap:
                 raise ValueError(f"{left_role} and {right_role} evalsets overlap in {evidence_type} evidence")
+        from trpc_agent_sdk.evaluation._eval_criterion import JSONCriterion
+
+        json_criterion = JSONCriterion()
+        if any(
+            json_criterion.matches(left_gold, right_gold)
+            for left_gold in evidence[left_role]["json_gold"]
+            for right_gold in evidence[right_role]["json_gold"]
+        ):
+            raise ValueError(f"{left_role} and {right_role} evalsets overlap in gold evidence")
 
 
 def _is_windows_reserved_name(value: Any) -> bool:
@@ -2019,6 +2240,10 @@ def apply_gate(
         normalized_gate_config = {}
         reasons.append("gate_config must be a mapping")
 
+    unknown_gate_keys = sorted(str(key) for key in set(normalized_gate_config) - GATE_RUNTIME_KEYS)
+    if unknown_gate_keys:
+        reasons.append("unknown gate config field(s): " + ", ".join(unknown_gate_keys))
+
     baseline_by_id, baseline_issues = _index_gate_cases(normalized_baseline)
     candidate_by_id, candidate_issues = _index_gate_cases(normalized_candidate)
     reasons.extend(baseline_issues)
@@ -2628,6 +2853,7 @@ async def build_offline_report(
             "baseline_prompt_patch": baseline_prompt_paths.get("prompt_patch", ""),
         }
     )
+    evaluation_snapshot = normalized_evaluation_config(OFFLINE_METRICS_CONFIG)
 
     return build_top_level_report(
         mode=mode,
@@ -2686,6 +2912,7 @@ async def build_offline_report(
             },
             "final_revalidation": {
                 "estimated_cost": 0.0,
+                "agent_calls_per_run": 0,
                 "agent_calls": 0,
                 "judge_calls_per_agent_call": 0,
                 "judge_model_calls": 0,
@@ -2704,6 +2931,8 @@ async def build_offline_report(
             "mode": mode,
             "seed": seed,
             "gate": gate_config,
+            "evaluation": evaluation_snapshot,
+            "evaluation_sha256": sha256_json(evaluation_snapshot),
             "paths": {
                 "train_evalset": str(train_evalset),
                 "optimizer_dev_evalset": str(optimizer_dev_evalset),
@@ -2865,14 +3094,32 @@ def judge_calls_per_agent_call(metrics_config: Mapping[str, Any]) -> int:
 def final_revalidation_call_audit(
     summaries: list[dict[str, Any]],
     metrics_config: dict[str, Any],
+    *,
+    evalset_payloads: list[dict[str, Any]] | None = None,
 ) -> dict[str, int]:
     num_runs, invalid_num_runs = _normalized_round_count(metrics_config.get("num_runs", 1))
     if invalid_num_runs or num_runs <= 0:
         raise ValueError("evaluation num_runs must be a positive integer")
-    case_runs = sum(len(summary.get("case_results", [])) for summary in summaries) * num_runs
+    if evalset_payloads is None:
+        agent_calls_per_run = sum(len(summary.get("case_results", [])) for summary in summaries)
+    else:
+        if len(evalset_payloads) != len(summaries):
+            raise ValueError("final revalidation payload count must match summary count")
+        agent_calls_per_run = 0
+        for payload in evalset_payloads:
+            cases = payload.get("eval_cases") if isinstance(payload, dict) else None
+            if not isinstance(cases, list):
+                raise ValueError("final revalidation evalset payload must contain eval_cases")
+            for case in cases:
+                conversation = case.get("conversation") if isinstance(case, dict) else None
+                if not isinstance(conversation, list) or not conversation:
+                    raise ValueError("final revalidation case must contain a non-empty conversation")
+                agent_calls_per_run += len(conversation)
+    case_runs = agent_calls_per_run * num_runs
     judge_multiplier = judge_calls_per_agent_call(metrics_config)
     judge_calls = case_runs * judge_multiplier
     return {
+        "agent_calls_per_run": agent_calls_per_run,
         "agent_calls": case_runs,
         "judge_calls_per_agent_call": judge_multiplier,
         "judge_model_calls": judge_calls,
@@ -3087,9 +3334,14 @@ async def run_online(
     system_path = resolve_path(system_prompt, SYSTEM_PROMPT_PATH)
     router_path = resolve_path(router_prompt, ROUTER_PROMPT_PATH)
     validate_inputs(train_path, optimizer_dev_path, val_path)
-    optimizer_evaluate_config = validated_optimizer_evaluate_config(optimizer_path)
+    runtime_optimizer_path = materialize_optimizer_config(
+        run_dir=run_dir,
+        source_config=optimizer_path,
+        seed=seed,
+    )
+    optimizer_evaluate_config = validated_optimizer_evaluate_config(runtime_optimizer_path)
     optimizer_judge_multiplier = judge_calls_per_agent_call(optimizer_evaluate_config)
-    gate = load_gate_config(gate_config_path, gate_config, optimizer_config=optimizer_path)
+    gate = load_gate_config(gate_config_path, gate_config, optimizer_config=runtime_optimizer_path)
     source_prompts = read_source_prompts(system_path, router_path)
 
     online_dir = _resolved_run_descendant(
@@ -3112,7 +3364,7 @@ async def run_online(
     route_metric_state = _install_route_tool_args_metric()
     try:
         result = await AgentOptimizer.optimize(
-            config_path=str(optimizer_path),
+            config_path=str(runtime_optimizer_path),
             call_agent=counted_optimizer_call_agent,
             target_prompt=target,
             train_dataset_path=str(train_path),
@@ -3128,7 +3380,7 @@ async def run_online(
     train_payload = load_json(train_path)
     optimizer_dev_payload = load_json(optimizer_dev_path)
     val_payload = load_json(val_path)
-    metrics_path = online_metrics_path(run_dir, optimizer_path)
+    metrics_path = online_metrics_path(run_dir, runtime_optimizer_path)
     source_prompt_texts = {name: text for name, (_, text) in source_prompts.items()}
     best_prompt_texts = {
         **source_prompt_texts,
@@ -3197,6 +3449,14 @@ async def run_online(
                 best_val,
             ],
             metrics_config,
+            evalset_payloads=[
+                train_payload,
+                optimizer_dev_payload,
+                val_payload,
+                train_payload,
+                optimizer_dev_payload,
+                val_payload,
+            ],
         ),
     )
     cost_usd = cost["estimated_total"]
@@ -3236,7 +3496,7 @@ async def run_online(
         gate_duration_seconds=gate_elapsed_seconds,
         cost_usd=cost_usd,
         seed=seed,
-        optimizer_config=optimizer_path,
+        optimizer_config=runtime_optimizer_path,
         prompt_artifacts=best_prompt_artifacts,
         artifacts={
             "native_optimizer_dir": existing_artifact(online_dir),
@@ -3265,7 +3525,7 @@ async def run_online(
         train_evalset=train_path,
         optimizer_dev_evalset=optimizer_dev_path,
         val_evalset=val_path,
-        optimizer_config=optimizer_path,
+        optimizer_config=runtime_optimizer_path,
         fixture_path=FIXTURE_PATH,
         metrics_path=metrics_path,
         system_prompt=system_path,
@@ -3275,10 +3535,13 @@ async def run_online(
     artifacts.update(
         {
             "online_eval_metrics": str(metrics_path),
+            "optimizer_source_config": str(optimizer_path),
+            "optimizer_runtime_config": str(runtime_optimizer_path),
             "baseline_prompt_dir": baseline_prompt_paths.get("prompt_dir", ""),
             "baseline_prompt_patch": baseline_prompt_paths.get("prompt_patch", ""),
         }
     )
+    evaluation_snapshot = normalized_evaluation_config(optimizer_evaluate_config)
     report = build_top_level_report(
         mode="online",
         run_id=actual_run_id,
@@ -3298,12 +3561,15 @@ async def run_online(
             "mode": "online",
             "seed": seed,
             "gate": gate,
+            "evaluation": evaluation_snapshot,
+            "evaluation_sha256": sha256_json(evaluation_snapshot),
             "paths": {
                 "train_evalset": str(train_path),
                 "optimizer_dev_evalset": str(optimizer_dev_path),
                 "validation_evalset": str(val_path),
                 "final_validation_evalset": str(val_path),
-                "optimizer_config": str(optimizer_path),
+                "optimizer_config": str(runtime_optimizer_path),
+                "optimizer_source_config": str(optimizer_path),
                 "online_eval_metrics": str(metrics_path),
                 "system_prompt": str(system_path),
                 "router_prompt": str(router_path),

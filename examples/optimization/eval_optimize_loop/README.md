@@ -65,7 +65,8 @@ judge calls are derived from counted candidate evaluations and every configured
 judge model sample. `judge_calls_per_candidate_evaluation` records that
 multiplier; a nonzero native counter is reconciled with the derived count
 without double counting, and `judge_model_call_source` records the source.
-Final revalidation records the corresponding `judge_calls_per_agent_call`.
+Final revalidation records the corresponding `judge_calls_per_agent_call` and
+counts every conversation turn, not only top-level cases.
 Because
 `AgentOptimizer` does not expose token or cost usage for candidate-evaluation
 or judge calls, optimizer phase totals are `null` and marked unknown whenever
@@ -97,6 +98,8 @@ critical-regression, cost, duration, and required-metric checks. By default the
 gate inherits `optimize.stop.required_metrics` from `optimizer.json`.
 Gate booleans require JSON booleans, numeric thresholds require finite
 non-negative JSON numbers, and malformed values reject without raising. The
+gate accepts only the documented field names; misspelled or unknown keys fail
+closed instead of falling back to a weaker default. The
 three evalset roles must be different files with no byte-identical content and
 no overlap in case IDs, normalized user inputs, or canonical gold outputs.
 Overlap checks cover every conversation turn and canonicalize valid JSON by
@@ -124,6 +127,13 @@ names also reject or normalize Windows reserved device basenames on every
 platform. Before each write, report, metrics, trace, prompt, and optimizer
 output paths are resolved beneath the run directory; pre-existing symlink
 redirection is rejected.
+
+Online mode writes an exact run-local `optimizer.json`, overrides its algorithm
+seed from `--seed`, and passes that file to `AgentOptimizer`. Candidate and
+environment audits reference the same path and SHA-256. `config_snapshot` also
+stores a normalized, credential-free evaluation configuration and its hash;
+report validation derives optimizer and final judge-call multipliers from that
+snapshot rather than trusting the reported counters.
 
 `optimizer_dev.evalset.json` is the optimizer-internal holdout passed to
 `AgentOptimizer.optimize(..., validation_dataset_path=...)`. `val.evalset.json`
