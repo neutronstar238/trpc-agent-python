@@ -847,6 +847,8 @@ def test_readme_includes_design_notes_and_sample_report_shape():
     assert "candidate_overfit" in readme
     assert "not globally suppressed" in readme
     assert "cleanup defect" in readme
+    assert "`tests/conftest.py` ignores" not in readme
+    assert "may fail during collection" in readme
 
     sample = load_report(EXAMPLE_DIR / "fixtures" / "optimization_report.sample.json")
     required = {

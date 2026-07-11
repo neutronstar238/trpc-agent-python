@@ -122,5 +122,6 @@ python examples/optimization/eval_optimize_loop/run_pipeline.py --mode trace
 
 Full repository pytest includes optional integration suites. In an environment
 without optional extras such as Cube/E2B, Mempalace, A2A, AG-UI, Claude Agent
-SDK, or OpenClaw dependencies, `tests/conftest.py` ignores those suites during
-collection and prints the missing dependency list in the pytest header.
+SDK, or OpenClaw dependencies, pytest may fail during collection before any
+tests run. Those dependency errors must be reported as an environment boundary;
+this example does not install a global collection hook to hide them.
