@@ -1931,10 +1931,16 @@ def summarize_evaluate_result(result: Any, evalset_payload: dict[str, Any]) -> d
         actual_text, expected_text = _extract_actual_expected(runs[0], case_by_id[eval_id])
         error_message = None
         for run in runs:
-            run_passed = run_passed and _is_passed_status(run.final_eval_status)
+            run_metrics = list(run.overall_eval_metric_results or [])
+            run_passed = (
+                run_passed
+                and _is_passed_status(run.final_eval_status)
+                and bool(run_metrics)
+                and all(_is_passed_status(metric.eval_status) for metric in run_metrics)
+            )
             if run.error_message and error_message is None:
                 error_message = sanitize_report_text(run.error_message)
-            for metric in run.overall_eval_metric_results:
+            for metric in run_metrics:
                 score = metric.score
                 metric_passed = _is_passed_status(metric.eval_status)
                 details = getattr(metric, "details", None)

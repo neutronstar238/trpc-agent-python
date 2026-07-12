@@ -829,6 +829,48 @@ def test_summary_omits_thoughts_and_redacts_provider_credentials_from_report_tex
     assert secret not in serialized_summary
 
 
+def test_summary_fails_closed_when_a_reported_metric_was_not_evaluated():
+    module = load_pipeline_module()
+    payload = load_report(EXAMPLE_DIR / "val.evalset.json")
+    case = payload["eval_cases"][0]
+    run = SimpleNamespace(
+        eval_metric_result_per_invocation=[],
+        final_eval_status="passed",
+        error_message=None,
+        overall_eval_metric_results=[
+            SimpleNamespace(
+                metric_name=ROUTE_TOOL_ARGS_METRIC,
+                score=None,
+                eval_status="not_evaluated",
+                details=None,
+                threshold=1.0,
+            ),
+            SimpleNamespace(
+                metric_name="llm_rubric_response",
+                score=1.0,
+                eval_status="passed",
+                details=None,
+                threshold=0.66,
+            ),
+        ],
+    )
+    result = SimpleNamespace(
+        results_by_eval_set_id={
+            payload["eval_set_id"]: SimpleNamespace(
+                eval_results_by_eval_id={case["eval_id"]: [run]},
+            )
+        }
+    )
+
+    summary = module.summarize_evaluate_result(result, payload)
+    case_result = summary["case_results"][0]
+
+    assert case_result["passed"] is False
+    assert case_result["root_cause"] in module.TAXONOMY
+    assert case_result["reasons"]
+    assert case["eval_id"] in summary["failed_case_ids"]
+
+
 @pytest.mark.parametrize(
     "sensitive_text",
     [
