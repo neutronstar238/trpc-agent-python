@@ -143,6 +143,77 @@ class TestJudgeGenerationConfigThink:
 
 class TestJudgeAgentPlanner:
 
+    @pytest.mark.asyncio
+    async def test_judge_agent_closes_its_agent_run(self):
+        captured = {"closed": False}
+
+        class _FakeAgentRun:
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            async def aclose(self):
+                captured["closed"] = True
+
+        agent_run = _FakeAgentRun()
+
+        class _FakeLlmAgent:
+
+            def __init__(self, **kwargs):
+                pass
+
+            def run_async(self, ctx):
+                return agent_run
+
+        class _FakeInvocationContext:
+
+            def __init__(self, **kwargs):
+                pass
+
+        with patch("trpc_agent_sdk.evaluation._llm_judge.LlmAgent", _FakeLlmAgent), patch(
+                "trpc_agent_sdk.evaluation._llm_judge.InvocationContext", _FakeInvocationContext):
+            judge = _JudgeAgent(
+                model=object(),
+                config=None,
+                system_prompt="sp",
+            )
+            await judge.get_response("evaluate this response")
+
+        assert captured["closed"] is True
+
+    @pytest.mark.asyncio
+    async def test_judge_agent_disables_model_streaming(self):
+        captured: dict[str, Any] = {}
+
+        class _FakeLlmAgent:
+
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            async def run_async(self, ctx):
+                captured["run_config"] = ctx.run_config
+                if False:  # pragma: no cover - makes this an async generator
+                    yield None
+
+        class _FakeInvocationContext:
+
+            def __init__(self, **kwargs):
+                self.run_config = kwargs["run_config"]
+
+        with patch("trpc_agent_sdk.evaluation._llm_judge.LlmAgent", _FakeLlmAgent), patch(
+                "trpc_agent_sdk.evaluation._llm_judge.InvocationContext", _FakeInvocationContext):
+            judge = _JudgeAgent(
+                model=object(),
+                config=None,
+                system_prompt="sp",
+            )
+            await judge.get_response("evaluate this response")
+
+        assert captured["run_config"].streaming is False
+
     def test_judge_agent_accepts_planner_and_forwards_to_llm_agent(self):
         captured: dict[str, Any] = {}
 

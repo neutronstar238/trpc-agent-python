@@ -111,13 +111,15 @@ a harmless explanation rewrite does not zero out an otherwise correct route.
 
 `environment_snapshot` records the git commit, dirty flag, Python version, SDK
 version when installed, model name, redacted base URL host, seed, command, and
-optimizer config path. It never records API keys. Provider/runtime warnings are
-not globally suppressed: an expected DeepSeek response-schema downgrade remains
-observable as a provider compatibility warning.
-The pipeline awaits `Runner.close()` on its own execution paths. Even so,
-upstream OpenAI/httpx may still emit Python 3.13 stream-shutdown diagnostics.
-Those warnings remain observable rather than being suppressed or automatically
-attributed to this example.
+optimizer config path. It never records API keys. When a judge provider does
+not support native JSON schemas, the judge uses JSON-object mode and validates
+the response locally instead of sending an ignored schema.
+Provider and runtime warnings are not globally suppressed. Judge calls run
+non-streaming and explicitly close their agent run so normal online evaluation
+does not leave OpenAI/httpx stream-shutdown diagnostics behind.
+The pipeline awaits `Runner.close()` for its agent execution paths.
+If an upstream OpenAI/httpx diagnostic still occurs outside this lifecycle,
+warnings remain observable rather than being filtered.
 
 Report error text redacts provider URLs, configured provider credentials,
 standalone provider-key shapes, and semantic credential markers while retaining
